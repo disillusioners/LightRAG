@@ -95,3 +95,4 @@ scripts/.env-test
 
 # Agent working directory
 .agents/
+.env-dockerhub
