@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+# Note: current tag version is: v1.6.2
+
 # Load Docker Hub credentials
 if [ -f ".env-dockerhub" ]; then
     set -a
