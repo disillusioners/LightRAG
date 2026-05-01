@@ -14,6 +14,7 @@ venv/
 # Enviroment Variable Files
 .env
 .env.backup.*
+.env-dockerhub
 
 # Generated Docker Compose files (output of setup wizard)
 docker-compose.*.yml
