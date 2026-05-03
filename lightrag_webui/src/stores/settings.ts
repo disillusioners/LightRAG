@@ -86,6 +86,10 @@ interface SettingsState {
   // Workspace settings
   currentWorkspace: string | null
   setCurrentWorkspace: (workspace: string | null) => void
+
+  // Workspace refresh trigger (non-persistent, runtime only)
+  workspaceRefreshTrigger: number
+  triggerWorkspaceRefresh: () => void
 }
 
 const useSettingsStoreBase = create<SettingsState>()(
@@ -240,11 +244,30 @@ const useSettingsStoreBase = create<SettingsState>()(
         })),
 
       currentWorkspace: null,
-      setCurrentWorkspace: (workspace: string | null) => set({ currentWorkspace: workspace })
+      setCurrentWorkspace: (workspace: string | null) => set({ currentWorkspace: workspace }),
+
+      // Workspace refresh trigger (not persisted)
+      workspaceRefreshTrigger: 0,
+      triggerWorkspaceRefresh: () =>
+        set((state) => ({
+          workspaceRefreshTrigger: state.workspaceRefreshTrigger + 1
+        })),
     }),
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
+      /* eslint-disable @typescript-eslint/no-unused-vars */
+      partialize: (state) => {
+        const {
+          workspaceRefreshTrigger,
+          triggerWorkspaceRefresh,
+          searchLabelDropdownRefreshTrigger,
+          triggerSearchLabelDropdownRefresh,
+          ...rest
+        } = state
+        return rest
+      },
+      /* eslint-enable @typescript-eslint/no-unused-vars */
       version: 20,
       migrate: (state: any, version: number) => {
         if (version < 2) {
