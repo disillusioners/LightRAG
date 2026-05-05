@@ -373,9 +373,9 @@ class Neo4JStorage(BaseGraphStorage):
                                 f"[{self.workspace}] Failed to drop existing index: {str(drop_error)}"
                             )
 
-                    # Create new index with CJK analyzer
+                    # Create new index with CJK analyzer for Chinese tokenizer support
                     logger.info(
-                        f"[{self.workspace}] Creating full-text index '{index_name}' with Chinese tokenizer support."
+                        f"[{self.workspace}] Creating full-text index '{index_name}' with CJK analyzer."
                     )
 
                     try:
@@ -1859,8 +1859,7 @@ class Neo4JStorage(BaseGraphStorage):
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         """
         Search labels(entity names) with fuzzy matching, using a full-text index for performance if available.
-        Enhanced with Chinese text support using CJK analyzer.
-        Falls back to a slower CONTAINS search if the index is not available or fails.
+        Falls back to a slower CONTAINS search if the index is unavailable, fails, or returns no results.
         """
         workspace_label = self._get_workspace_label()
         query_strip = query.strip()
@@ -1927,9 +1926,14 @@ class Neo4JStorage(BaseGraphStorage):
                 await result.consume()
 
                 logger.debug(
-                    f"[{self.workspace}] Full-text search ({'Chinese' if is_chinese else 'Latin'}) for '{query}' returned {len(labels)} results (limit: {limit})"
+                    f"[{self.workspace}] Full-text search ({'Chinese' if is_chinese else 'Latin'}) "
+                    f"for '{query}' returned {len(labels)} results (limit: {limit})"
                 )
-                return labels
+
+                # Fulltext analyzers split on underscores, so entity names like `reasoning_content`
+                # may not match via full-text search. The CONTAINS fallback catches these cases.
+                if labels:
+                    return labels
 
         except Exception as e:
             # If the full-text search fails, fall back to CONTAINS search
@@ -1938,57 +1942,57 @@ class Neo4JStorage(BaseGraphStorage):
                 "Falling back to slower, non-indexed search."
             )
 
-            # Enhanced fallback implementation
-            async with self._driver.session(
-                database=self._DATABASE, default_access_mode="READ"
-            ) as session:
-                if is_chinese:
-                    # For Chinese text, use direct CONTAINS without case conversion
-                    cypher_query = f"""
-                    MATCH (n:`{workspace_label}`)
-                    WHERE n.entity_id IS NOT NULL
-                    WITH n.entity_id AS label
-                    WHERE label CONTAINS $query_strip
-                    WITH label,
-                         CASE
-                             WHEN label = $query_strip THEN 1000
-                             WHEN label STARTS WITH $query_strip THEN 500
-                             ELSE 100 - size(label)
-                         END AS score
-                    ORDER BY score DESC, label ASC
-                    LIMIT $limit
-                    RETURN label
-                    """
-                    result = await session.run(
-                        cypher_query, query_strip=query_strip, limit=limit
-                    )
-                else:
-                    # For non-Chinese text, use the original fallback logic
-                    cypher_query = f"""
-                    MATCH (n:`{workspace_label}`)
-                    WHERE n.entity_id IS NOT NULL
-                    WITH n.entity_id AS label, toLower(n.entity_id) AS label_lower
-                    WHERE label_lower CONTAINS $query_lower
-                    WITH label, label_lower,
-                         CASE
-                             WHEN label_lower = $query_lower THEN 1000
-                             WHEN label_lower STARTS WITH $query_lower THEN 500
-                             ELSE 100 - size(label)
-                         END AS score
-                    ORDER BY score DESC, label ASC
-                    LIMIT $limit
-                    RETURN label
-                    """
-                    result = await session.run(
-                        cypher_query, query_lower=query_lower, limit=limit
-                    )
-
-                labels = [record["label"] async for record in result]
-                await result.consume()
-                logger.debug(
-                    f"[{self.workspace}] Fallback search ({'Chinese' if is_chinese else 'Latin'}) for '{query}' returned {len(labels)} results (limit: {limit})"
+        # CONTAINS fallback: triggered by exception OR by empty full-text results
+        async with self._driver.session(
+            database=self._DATABASE, default_access_mode="READ"
+        ) as session:
+            if is_chinese:
+                # For Chinese text, use direct CONTAINS without case conversion
+                cypher_query = f"""
+                MATCH (n:`{workspace_label}`)
+                WHERE n.entity_id IS NOT NULL
+                WITH n.entity_id AS label
+                WHERE label CONTAINS $query_strip
+                WITH label,
+                     CASE
+                         WHEN label = $query_strip THEN 1000
+                         WHEN label STARTS WITH $query_strip THEN 500
+                         ELSE 100 - size(label)
+                     END AS score
+                ORDER BY score DESC, label ASC
+                LIMIT $limit
+                RETURN label
+                """
+                result = await session.run(
+                    cypher_query, query_strip=query_strip, limit=limit
                 )
-                return labels
+            else:
+                # For non-Chinese text, use the original fallback logic
+                cypher_query = f"""
+                MATCH (n:`{workspace_label}`)
+                WHERE n.entity_id IS NOT NULL
+                WITH n.entity_id AS label, toLower(n.entity_id) AS label_lower
+                WHERE label_lower CONTAINS $query_lower
+                WITH label, label_lower,
+                     CASE
+                         WHEN label_lower = $query_lower THEN 1000
+                         WHEN label_lower STARTS WITH $query_lower THEN 500
+                         ELSE 100 - size(label)
+                     END AS score
+                ORDER BY score DESC, label ASC
+                LIMIT $limit
+                RETURN label
+                """
+                result = await session.run(
+                    cypher_query, query_lower=query_lower, limit=limit
+                )
+
+            labels = [record["label"] async for record in result]
+            await result.consume()
+            logger.debug(
+                f"[{self.workspace}] Fallback search ({'Chinese' if is_chinese else 'Latin'}) for '{query}' returned {len(labels)} results (limit: {limit})"
+            )
+            return labels
 
     async def drop(self) -> dict[str, str]:
         """Drop all data from current workspace storage and clean up resources
