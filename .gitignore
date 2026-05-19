@@ -96,3 +96,6 @@ scripts/.env-test
 # Agent working directory
 .agents/
 .env-dockerhub
+
+# native_parser/docx CLI output (audit JSONL + image dir)
+/parse_output/
