@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import { createSelectors } from '@/lib/utils'
-import { defaultQueryLabel } from '@/lib/constants'
+import { defaultQueryLabel, suggestedUserPrompts } from '@/lib/constants'
 import { Message, QueryRequest } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
@@ -127,10 +127,10 @@ const useSettingsStoreBase = create<SettingsState>()(
       documentsPageSize: 10,
 
       retrievalHistory: [],
-      userPromptHistory: [],
+      userPromptHistory: [...suggestedUserPrompts],
 
       querySettings: {
-        mode: 'global',
+        mode: 'mix',
         top_k: 40,
         chunk_top_k: 20,
         max_entity_tokens: 6000,
@@ -373,6 +373,15 @@ const useSettingsStoreBase = create<SettingsState>()(
         }
         if (version < 20) {
           state.currentWorkspace = null
+          // One-time injection of system-suggested prompts; append after any existing
+          // history so user's own prompts keep priority. Skip any prompt already
+          // present to avoid duplicate dropdown entries (matches the de-duping in
+          // addUserPromptToHistory). version monotonicity makes this run at most once.
+          const existing = state.userPromptHistory ?? []
+          state.userPromptHistory = [
+            ...existing,
+            ...suggestedUserPrompts.filter((p: string) => !existing.includes(p))
+          ]
         }
         return state
       }

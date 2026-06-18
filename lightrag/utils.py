@@ -4,6 +4,7 @@ import weakref
 import sys
 
 import asyncio
+import bisect
 import html
 import csv
 import inspect
@@ -14,10 +15,12 @@ import os
 import re
 import time
 import uuid
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from hashlib import md5
+from pathlib import Path
 from typing import (
     Any,
     Protocol,
@@ -38,9 +41,17 @@ from lightrag.constants import (
     DEFAULT_LOG_FILENAME,
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_PROCESSING_PRIORITY,
     DEFAULT_SOURCE_IDS_LIMIT_METHOD,
     VALID_SOURCE_IDS_LIMIT_METHODS,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
+    PARSED_DIR_NAME,
+    DEFAULT_GLOBAL_SLOT_POLL_MIN,
+    DEFAULT_GLOBAL_SLOT_POLL_DEFERRED_MAX,
+    DEFAULT_GLOBAL_SLOT_DRAIN_LIMIT,
+    DEFAULT_ZOMBIE_COMPACT_THRESHOLD,
+    DEFAULT_COMPACT_BATCH_LIMIT,
+    DEFAULT_QUEUE_STATS_MIN_PUBLISH_INTERVAL,
 )
 
 # Precompile regex pattern for JSON sanitization (module-level, compiled once)
@@ -137,6 +148,9 @@ async def safe_vdb_operation_with_exception(
     max_retries: int = 3,
     retry_delay: float = 0.2,
     logger_func: Optional[Callable] = None,
+    timeout_seconds: float | None = None,
+    log_start: bool = False,
+    success_log_threshold_seconds: float = 10.0,
 ) -> None:
     """
     Safely execute vector database operations with retry mechanism and exception handling.
@@ -151,6 +165,9 @@ async def safe_vdb_operation_with_exception(
         max_retries: Maximum number of retry attempts
         retry_delay: Delay between retries in seconds
         logger_func: Logger function to use for error messages
+        timeout_seconds: Optional timeout for a single operation attempt
+        log_start: Whether to emit start/success logs for each attempt
+        success_log_threshold_seconds: Log successful attempts when duration exceeds this threshold
 
     Raises:
         Exception: When operation fails after all retry attempts
@@ -158,20 +175,80 @@ async def safe_vdb_operation_with_exception(
     log_func = logger_func or logger.warning
 
     for attempt in range(max_retries):
+        start_ts = time.perf_counter()
+        attempt_label = f"{attempt + 1}/{max_retries}"
         try:
-            await operation()
+            if log_start:
+                logger.info(
+                    "VDB %s start for %s (attempt %s, timeout=%s)",
+                    operation_name,
+                    entity_name or "<unknown>",
+                    attempt_label,
+                    f"{timeout_seconds:.1f}s"
+                    if timeout_seconds is not None
+                    else "none",
+                )
+
+            if timeout_seconds is not None and timeout_seconds > 0:
+                await asyncio.wait_for(operation(), timeout=timeout_seconds)
+            else:
+                await operation()
+
+            elapsed = time.perf_counter() - start_ts
+            if log_start or elapsed >= success_log_threshold_seconds:
+                logger.info(
+                    "VDB %s success for %s in %.2fs (attempt %s)",
+                    operation_name,
+                    entity_name or "<unknown>",
+                    elapsed,
+                    attempt_label,
+                )
             return  # Success, return immediately
-        except Exception as e:
+        except asyncio.TimeoutError as e:
+            elapsed = time.perf_counter() - start_ts
+            timeout_msg = (
+                f"VDB {operation_name} timeout for {entity_name or '<unknown>'} "
+                f"after {elapsed:.2f}s (attempt {attempt_label}, timeout={timeout_seconds}s)"
+            )
             if attempt >= max_retries - 1:
-                error_msg = f"VDB {operation_name} failed for {entity_name} after {max_retries} attempts: {e}"
+                log_func(timeout_msg)
+                raise TimeoutError(timeout_msg) from e
+            log_func(f"{timeout_msg}, retrying...")
+            if retry_delay > 0:
+                await asyncio.sleep(retry_delay)
+        except Exception as e:
+            elapsed = time.perf_counter() - start_ts
+            if attempt >= max_retries - 1:
+                error_msg = (
+                    f"VDB {operation_name} failed for {entity_name or '<unknown>'} "
+                    f"after {max_retries} attempts in {elapsed:.2f}s: {e}"
+                )
                 log_func(error_msg)
                 raise Exception(error_msg) from e
             else:
                 log_func(
-                    f"VDB {operation_name} attempt {attempt + 1} failed for {entity_name}: {e}, retrying..."
+                    f"VDB {operation_name} attempt {attempt + 1} failed for "
+                    f"{entity_name or '<unknown>'} after {elapsed:.2f}s: {e}, retrying..."
                 )
                 if retry_delay > 0:
                     await asyncio.sleep(retry_delay)
+
+
+def parse_optional_float(raw: str | None) -> float | None:
+    """Decode env strings (or any text) into ``float | None``.
+
+    Empty string and the literal ``"None"`` (case-insensitive) collapse
+    to ``None`` so users can leave a knob un-set in ``.env`` and have
+    the consuming code fall back to its own default.  Any other
+    non-numeric value raises :class:`ValueError` so misconfigured envs
+    fail loudly at parse time rather than silently downstream.
+    """
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped or stripped.lower() == "none":
+        return None
+    return float(stripped)
 
 
 def get_env_value(
@@ -579,6 +656,79 @@ def compute_args_hash(*args: Any) -> str:
         return md5(safe_bytes).hexdigest()
 
 
+def _serialize_cache_variant(value: Any) -> str:
+    """Serialize cache-affecting options to a stable string for hash inputs."""
+    if value is None:
+        return ""
+
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        try:
+            value = value.model_dump(mode="json")
+        except TypeError:
+            value = value.model_dump()
+
+    if hasattr(value, "model_json_schema") and callable(value.model_json_schema):
+        value = value.model_json_schema()
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=repr,
+        )
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def get_llm_cache_identity(
+    global_config: dict[str, Any] | None,
+    role: str,
+) -> dict[str, Any]:
+    """Get the non-secret LLM identity used to partition LLM cache keys.
+
+    Includes ``role``, ``binding``, ``model``, and ``host``. Deliberately excludes
+    ``api_key`` and ``provider_options`` so cache keys remain non-secret and safe
+    to persist.
+    """
+    config = global_config or {}
+    identities = config.get("llm_cache_identities")
+    if isinstance(identities, dict):
+        identity = identities.get(role)
+        if isinstance(identity, dict):
+            return dict(identity)
+
+    return {
+        "role": role,
+        "binding": None,
+        "model": config.get("llm_model_name"),
+        "host": None,
+    }
+
+
+def serialize_llm_cache_identity(identity: Any) -> str:
+    """Serialize an LLM cache identity for inclusion in hash inputs."""
+    return _serialize_cache_variant(identity)
+
+
+def _validate_cached_response_format(response_format: Any | None) -> None:
+    """Reject structured-output modes that the cache wrapper does not support."""
+    if response_format is None:
+        return
+
+    if (
+        isinstance(response_format, dict)
+        and response_format.get("type") == "json_object"
+    ):
+        return
+
+    raise ValueError(
+        "use_llm_func_with_cache only supports response_format={'type': 'json_object'}; "
+        "json_schema and typed response_format values must not be passed through the cache wrapper."
+    )
+
+
 def compute_mdhash_id(content: str, prefix: str = "") -> str:
     """
     Compute a unique ID for a given content string.
@@ -586,6 +736,55 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
     The ID is a combination of the given prefix and the MD5 hash of the content string.
     """
     return prefix + compute_args_hash(content)
+
+
+def get_unique_filename_in_parsed(target_dir: Path, original_name: str) -> str:
+    """Generate a unique filename in target_dir, adding numeric suffixes on conflict.
+
+    Tries the original name first, then `{stem}_001{ext}` ... `{stem}_999{ext}`,
+    falling back to a timestamp-suffixed name if all numeric slots are taken.
+    """
+    original_path = Path(original_name)
+    base_name = original_path.stem
+    extension = original_path.suffix
+
+    if not (target_dir / original_name).exists():
+        return original_name
+
+    for i in range(1, 1000):
+        new_name = f"{base_name}_{i:03d}{extension}"
+        if not (target_dir / new_name).exists():
+            return new_name
+
+    return f"{base_name}_{int(time.time())}{extension}"
+
+
+async def move_file_to_parsed_dir(
+    file_path: Path,
+    *,
+    skip_if_already_parsed: bool = False,
+) -> Path | None:
+    """Move a processed source file into its sibling __parsed__ directory.
+
+    Returns the new path on success, the input path if `skip_if_already_parsed`
+    is set and the file already lives in a `__parsed__` directory, or None if
+    the source no longer exists.
+    """
+    if not file_path.exists() or not file_path.is_file():
+        return None
+    if skip_if_already_parsed and file_path.parent.name == PARSED_DIR_NAME:
+        return file_path
+
+    parsed_dir = file_path.parent / PARSED_DIR_NAME
+    await asyncio.to_thread(parsed_dir.mkdir, parents=True, exist_ok=True)
+
+    unique_filename = get_unique_filename_in_parsed(parsed_dir, file_path.name)
+    target_path = parsed_dir / unique_filename
+    await asyncio.to_thread(file_path.rename, target_path)
+    logger.debug(
+        f"Moved file to parsed directory: {file_path.name} -> {unique_filename}"
+    )
+    return target_path
 
 
 def make_relation_vdb_ids(src_entity: str, tgt_entity: str) -> list[str]:
@@ -641,6 +840,19 @@ class QueueFullError(Exception):
     pass
 
 
+class VectorStorageConsistencyError(Exception):
+    """Raised when a vector storage write fails after the graph has already been updated.
+
+    The knowledge graph (plus the text_chunks KV store) is the authoritative data
+    source, so no data is lost — but the vector storage no longer mirrors the graph
+    and query results may be incomplete until it is rebuilt. Stop the LightRAG
+    server and run the offline rebuild tool (``lightrag-rebuild-vdb``) to restore
+    consistency.
+    """
+
+    pass
+
+
 class WorkerTimeoutError(Exception):
     """Worker-level timeout exception with specific timeout information"""
 
@@ -669,6 +881,7 @@ def priority_limit_async_func_call(
     max_queue_size: int = 1000,
     cleanup_timeout: float = 2.0,
     queue_name: str = "limit_async",
+    concurrency_group: str | None = None,
 ):
     """
     Enhanced priority-limited asynchronous function call decorator with robust timeout handling
@@ -678,6 +891,7 @@ def priority_limit_async_func_call(
     - Task state tracking to prevent race conditions
     - Enhanced health check system with stuck task detection
     - Proper resource cleanup and error recovery
+    - Optional cross-process global concurrency gating (gunicorn multi-worker)
 
     Args:
         max_size: Maximum number of concurrent calls
@@ -687,6 +901,20 @@ def priority_limit_async_func_call(
         max_task_duration: Maximum time before health check intervenes (defaults to llm_timeout + 60s)
         cleanup_timeout: Maximum time to wait for cleanup operations (defaults to 2.0s)
         queue_name: Optional queue name for logging identification (defaults to "limit_async")
+        concurrency_group: Optional cross-process concurrency group name (e.g.
+            "llm:extract", "embedding", "rerank"). When shared storage was
+            initialized with a global limit for this group, workers acquire a
+            cross-worker slot (lease with heartbeat self-healing) before
+            executing, capping total in-flight calls across all gunicorn
+            workers; the group's queue stats are also published for /health
+            aggregation. With no global limit configured for the group
+            (single-process / embedded usage) the slot gate is bypassed —
+            execution behavior matches the original per-process decorator —
+            but queue stats are still published to shared storage so the
+            aggregated /health view works; in single-process mode that is a
+            cheap local-dict write (no IPC, no slot acquisition). Only
+            concurrency_group=None is fully self-contained: shared storage is
+            never touched at all (no slot gate AND no stats publishing).
 
     Returns:
         Decorator function
@@ -709,12 +937,17 @@ def priority_limit_async_func_call(
                     llm_timeout * 2 + 15
                 )  # Reserved timeout buffer for health check phase
 
-        queue = asyncio.PriorityQueue(maxsize=max_queue_size)
+        # The queue is created lazily in ensure_workers(): the default path
+        # keeps the bounded queue, while global-limit mode needs an unbounded
+        # physical queue (admission is enforced logically via live_queued so
+        # cancelled-but-not-yet-drained tuples can never wedge the queue).
+        queue: asyncio.PriorityQueue | None = None
         tasks = set()
         initialization_lock = asyncio.Lock()
         counter = 0
         shutdown_event = asyncio.Event()
         initialized = False
+        accepting_new_tasks = True
         worker_health_check_task = None
 
         # Enhanced task state management
@@ -722,6 +955,280 @@ def priority_limit_async_func_call(
         task_states_lock = asyncio.Lock()
         active_futures = weakref.WeakSet()
         reinit_count = 0
+        submitted_total = 0
+        completed_total = 0
+        failed_total = 0
+        cancelled_total = 0
+        rejected_total = 0
+
+        # --- Cross-worker global concurrency gate state (global-limit mode) ---
+        # Tri-state: None until resolved on first ensure_workers() (which runs
+        # after initialize_share_data() in every supported flow).
+        use_global_limit: bool | None = None
+        publish_stats = False
+        shared = None  # lazily imported lightrag.kg.shared_storage module
+        work_available = asyncio.Event()
+        admission_cond = asyncio.Condition()
+        # Logical queued count: live tasks waiting in the queue (excludes
+        # running tasks and cancelled zombies) — same capacity semantics as
+        # the bounded queue's maxsize in the default path.
+        live_queued = 0
+        held_leases: set[str] = set()
+        pending_release: set[str] = set()
+        global_slot_waits = 0
+        zombie_compact_threshold = max(
+            DEFAULT_ZOMBIE_COMPACT_THRESHOLD,
+            max_queue_size if max_queue_size > 0 else 0,
+        )
+        # Slot pump machinery (global-limit mode): ONE coroutine per process
+        # acquires global slots and hands (lease, task) pairs to executor
+        # workers through dispatch_queue. executing counts tasks picked up
+        # by workers; worker_free wakes the pump when one finishes.
+        # NOTE: dispatch_queue deliberately never gets task_done()/join() —
+        # the join()-based graceful drain tracks the PHYSICAL queue only (a
+        # dispatched item's physical-queue task_done() is deferred to the
+        # worker), and shutdown empties any undelivered dispatch entries with
+        # a get_nowait() loop. So dispatch_queue.unfinished_tasks grows
+        # unbounded by design; it is never read. Don't add a join() here
+        # without also adding matching task_done() calls.
+        dispatch_queue: asyncio.Queue | None = None
+        pump_task: asyncio.Task | None = None
+        executing = 0
+        worker_free = asyncio.Event()
+        last_publish_time = 0.0
+        last_release_warn_time = 0.0
+        last_renew_warn_time = 0.0
+
+        def _resolve_mode() -> bool:
+            """Resolve global-limit / stats-publishing mode from shared storage.
+
+            Returns True when the resolution is final. Never imports or
+            touches shared storage when concurrency_group is None
+            (standalone decorator usage stays fully self-contained).
+            """
+            nonlocal use_global_limit, publish_stats, shared
+            if use_global_limit is not None:
+                return True
+            if concurrency_group is None:
+                use_global_limit = False
+                publish_stats = False
+                return True
+            if shared is None:
+                from lightrag.kg import shared_storage as shared_module
+
+                shared = shared_module
+            if not shared.is_share_data_initialized():
+                return False  # not final yet — caller decides how to commit
+            use_global_limit = shared.is_global_concurrency_limited(concurrency_group)
+            publish_stats = True
+            return True
+
+        def _snapshot() -> dict:
+            """Synchronous snapshot of local state for cross-worker publishing.
+
+            Reads counters without locks: all mutations happen on the event
+            loop between awaits, so a synchronous read is always consistent.
+            """
+            running = sum(
+                1
+                for task_state in task_states.values()
+                if task_state.worker_started and not task_state.future.done()
+            )
+            physical_queued = queue.qsize() if queue is not None else 0
+            return {
+                "queue_name": queue_name,
+                "max_async": max_size,
+                "max_queue_size": max_queue_size,
+                "queued": live_queued if use_global_limit else physical_queued,
+                "physical_queued": physical_queued,
+                "running": running,
+                "in_flight": len(task_states),
+                "worker_count": len([task for task in tasks if not task.done()]),
+                "initialized": initialized,
+                "submitted_total": submitted_total,
+                "completed_total": completed_total,
+                "failed_total": failed_total,
+                "cancelled_total": cancelled_total,
+                "rejected_total": rejected_total,
+                "global_slot_waits": global_slot_waits,
+                "pid": os.getpid(),
+                "updated_at": time.time(),
+            }
+
+        async def _publish_stats(force: bool = False) -> None:
+            """Best-effort, debounced publish of the local stats snapshot.
+
+            Called from counter-update points (debounced to the min publish
+            interval) and force-flushed by the 5s maintenance pass, which
+            also propagates any counter change that happened between
+            debounced publishes and keeps the snapshot ahead of the
+            aggregation stale TTL.
+            """
+            nonlocal last_publish_time
+            if not publish_stats:
+                return
+            now = time.time()
+            if (
+                not force
+                and now - last_publish_time < DEFAULT_QUEUE_STATS_MIN_PUBLISH_INTERVAL
+            ):
+                return
+            try:
+                await shared.publish_queue_stats(queue_name, _snapshot())
+                last_publish_time = now
+            except Exception as e:
+                logger.debug(f"{queue_name}: queue stats publish failed: {e}")
+
+        async def _notify_admission() -> None:
+            async with admission_cond:
+                admission_cond.notify_all()
+
+        async def _try_acquire_slot() -> tuple[str | None, bool]:
+            """Non-blocking global slot acquisition (fail-closed on errors).
+
+            Returns ``(lease_id, is_priority_waiter)``: on failure the
+            second element reports whether this process is the
+            longest-waiting live poller of the group, which drives the
+            adaptive poll backoff below.
+            """
+            try:
+                lease_id, is_priority = await shared.try_acquire_global_slot_tracked(
+                    concurrency_group
+                )
+            except Exception as e:
+                # try_acquire_global_slot_tracked is fail-closed internally;
+                # this guard keeps the worker alive even if it ever raises.
+                logger.debug(f"{queue_name}: global slot acquisition error: {e}")
+                return None, False
+            if lease_id is not None:
+                held_leases.add(lease_id)
+            return lease_id, is_priority
+
+        async def _release_lease_safely(lease_id: str) -> None:
+            """Release a global slot without raising (safe in finally blocks).
+
+            A failed release is parked in pending_release: it is no longer
+            renewed, the health check retries it, and even if every retry
+            fails the heartbeat TTL guarantees any process eventually
+            reclaims the slot — capacity never leaks permanently.
+            """
+            nonlocal last_release_warn_time
+            held_leases.discard(lease_id)
+            try:
+                await shared.release_global_slot(concurrency_group, lease_id)
+                pending_release.discard(lease_id)
+            except asyncio.CancelledError:
+                pending_release.add(lease_id)
+                raise
+            except Exception as e:
+                pending_release.add(lease_id)
+                now = time.time()
+                if now - last_release_warn_time >= 30.0:
+                    last_release_warn_time = now
+                    logger.warning(
+                        f"{queue_name}: failed to release global slot lease "
+                        f"(queued for retry; heartbeat expiry guarantees "
+                        f"reclamation): {e}"
+                    )
+
+        async def _compact_physical_queue() -> None:
+            """Drain zombie tuples that accumulate while no slot is available.
+
+            Without this, a long fail-closed period (shared storage errors)
+            or externally saturated slots would let cancelled tasks pile up
+            in the unbounded physical queue with no consumer. Bounded batches
+            keep the event loop responsive; every popped tuple gets exactly
+            one task_done() (live tuples are re-queued first, adding a fresh
+            unfinished count) so queue.join() in shutdown never wedges.
+            """
+            nonlocal live_queued
+            if queue is None or not use_global_limit:
+                return
+            if queue.qsize() - live_queued <= zombie_compact_threshold:
+                return
+            survivors = []
+            scanned = 0
+            notify_needed = False
+            while scanned < DEFAULT_COMPACT_BATCH_LIMIT:
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                scanned += 1
+                task_id = item[2]
+                is_zombie = False
+                # Classify under task_states_lock so we serialize with the
+                # wait_func timeout cleanup path (never judge by a stale
+                # snapshot taken outside the lock).
+                async with task_states_lock:
+                    task_state = task_states.get(task_id)
+                    if (
+                        task_state is None
+                        or task_state.cancellation_requested
+                        or task_state.future.cancelled()
+                        or task_state.future.done()
+                    ):
+                        is_zombie = True
+                        if task_state is not None:
+                            task_states.pop(task_id, None)
+                            if not task_state.worker_started:
+                                live_queued -= 1
+                                notify_needed = True
+                if is_zombie:
+                    queue.task_done()
+                else:
+                    survivors.append(item)
+            for item in survivors:
+                queue.put_nowait(item)
+                queue.task_done()
+            if survivors:
+                work_available.set()
+            if notify_needed:
+                await _notify_admission()
+
+        async def _run_maintenance() -> None:
+            """One heartbeat pass of cross-worker upkeep (never raises).
+
+            Runs every health-check tick: lease renewal (correctness path —
+            failures get a rate-limited WARNING, the suspect grace absorbs
+            short outages), pending-release retries, lease reaping, zombie
+            compaction, and a forced stats flush (which also keeps this
+            worker's snapshot from going stale in the aggregation view).
+            """
+            nonlocal last_renew_warn_time
+            if use_global_limit:
+                try:
+                    await shared.renew_global_slots(
+                        concurrency_group, tuple(held_leases)
+                    )
+                except Exception as e:
+                    now = time.time()
+                    if now - last_renew_warn_time >= 30.0:
+                        last_renew_warn_time = now
+                        logger.warning(
+                            f"{queue_name}: global slot lease renewal failed "
+                            f"(leases may be reclaimed after the suspect "
+                            f"grace if this persists): {e}"
+                        )
+                for lease_id in tuple(pending_release):
+                    try:
+                        await shared.release_global_slot(concurrency_group, lease_id)
+                        pending_release.discard(lease_id)
+                    except Exception as e:
+                        logger.debug(
+                            f"{queue_name}: pending lease release retry failed: {e}"
+                        )
+                        break  # shared area still unhealthy; retry next pass
+                try:
+                    await shared.reconcile_global_slots(concurrency_group)
+                except Exception as e:
+                    logger.debug(f"{queue_name}: global slot reconcile failed: {e}")
+                try:
+                    await _compact_physical_queue()
+                except Exception as e:
+                    logger.warning(f"{queue_name}: queue compaction failed: {e}")
+            if publish_stats:
+                await _publish_stats(force=True)
 
         async def worker():
             """Enhanced worker that processes tasks with proper timeout and state management"""
@@ -749,7 +1256,7 @@ def priority_limit_async_func_call(
                             task_state.worker_started = True
                             # Record execution start time when worker actually begins processing
                             task_state.execution_start_time = (
-                                asyncio.get_event_loop().time()
+                                asyncio.get_running_loop().time()
                             )
 
                         # Check if task was cancelled before worker started
@@ -815,14 +1322,258 @@ def priority_limit_async_func_call(
             finally:
                 logger.debug(f"{queue_name}: Worker exiting")
 
+        async def slot_pump():
+            """Single per-process slot acquirer for global-limit mode.
+
+            Slot-first, drain-second: the pump acquires a cross-process slot
+            BEFORE consuming the local queue, so while slots are saturated
+            tasks stay queued (cancellable, never misjudged as running) and
+            local priority order is preserved — the queue head is committed
+            only once a slot is held, so a later high-priority arrival can
+            still overtake. Centralizing acquisition in ONE coroutine
+            (instead of max_size polling workers) divides the cross-process
+            poll/IPC rate by max_size, and a slot is requested only when
+            there is BOTH physically queued work and an idle worker to run
+            it immediately — the worker herd can no longer grab slots it
+            cannot use (which inflated global_in_use and reset this
+            process's waiter seniority on every no-op acquire). Residual
+            churn: queued items may all turn out to be zombies after the
+            slot is acquired (drained bounded, slot returned right away).
+            """
+            nonlocal live_queued, global_slot_waits
+            poll_delay = DEFAULT_GLOBAL_SLOT_POLL_MIN
+            try:
+                while not shutdown_event.is_set():
+                    try:
+                        # Idle wait on an event instead of qsize polling. The
+                        # clear-then-recheck ordering has no await in between,
+                        # so a concurrent put+set can never be lost; the 1.0s
+                        # timeout only preserves the shutdown check.
+                        if queue.qsize() == 0:
+                            work_available.clear()
+                            if queue.qsize() == 0:
+                                try:
+                                    await asyncio.wait_for(
+                                        work_available.wait(), timeout=1.0
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+                                continue
+
+                        # Never hold a slot no local worker could service
+                        # immediately: undelivered dispatches plus running
+                        # executions already saturate max_size.
+                        if dispatch_queue.qsize() + executing >= max_size:
+                            worker_free.clear()
+                            if dispatch_queue.qsize() + executing >= max_size:
+                                try:
+                                    await asyncio.wait_for(
+                                        worker_free.wait(), timeout=1.0
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+                                continue
+
+                        # Acquire a global slot before touching the queue —
+                        # tasks must remain queued (and cancellable) while
+                        # all slots are busy. Fail-closed errors land here
+                        # too, as a None lease.
+                        lease_id, is_priority_waiter = await _try_acquire_slot()
+                        if lease_id is None:
+                            global_slot_waits += 1
+                            # Soft FIFO across processes: the longest-waiting
+                            # live process keeps the fastest poll rate so it
+                            # usually claims the next freed slot; everyone
+                            # else backs off, bounded by the deferred cap so
+                            # a freed slot is never left idle for long when
+                            # the favored waiter is gone (promotion lag).
+                            if is_priority_waiter:
+                                poll_delay = DEFAULT_GLOBAL_SLOT_POLL_MIN
+                            else:
+                                poll_delay = min(
+                                    poll_delay * 2,
+                                    DEFAULT_GLOBAL_SLOT_POLL_DEFERRED_MAX,
+                                )
+                            await asyncio.sleep(poll_delay)
+                            continue
+                        poll_delay = DEFAULT_GLOBAL_SLOT_POLL_MIN
+
+                        live_task = None
+                        dispatched = False
+                        try:
+                            # Take the queue head, draining zombies (bounded
+                            # by the drain limit so a zombie-heavy process
+                            # doesn't hog a scarce slot for local cleanup).
+                            zombies_drained = 0
+                            notify_needed = False
+                            while live_task is None:
+                                try:
+                                    item = queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    # All queued items were zombies (or
+                                    # compaction holds them): return the
+                                    # slot immediately.
+                                    break
+                                task_id, args, kwargs = item[2], item[3], item[4]
+                                is_zombie = False
+                                async with task_states_lock:
+                                    task_state = task_states.get(task_id)
+                                    if (
+                                        task_state is None
+                                        or task_state.cancellation_requested
+                                        or task_state.future.cancelled()
+                                        or task_state.future.done()
+                                    ):
+                                        is_zombie = True
+                                        if task_state is not None:
+                                            task_states.pop(task_id, None)
+                                            if not task_state.worker_started:
+                                                live_queued -= 1
+                                                notify_needed = True
+                                    else:
+                                        task_state.worker_started = True
+                                        task_state.execution_start_time = (
+                                            asyncio.get_running_loop().time()
+                                        )
+                                        live_queued -= 1
+                                        notify_needed = True
+                                        live_task = (
+                                            task_id,
+                                            task_state,
+                                            args,
+                                            kwargs,
+                                        )
+                                if is_zombie:
+                                    # Never call the provider for a zombie.
+                                    queue.task_done()
+                                    zombies_drained += 1
+                                    if (
+                                        zombies_drained
+                                        >= DEFAULT_GLOBAL_SLOT_DRAIN_LIMIT
+                                    ):
+                                        break
+                            if live_task is not None:
+                                # No suspension points between claiming the
+                                # live task above and this put_nowait, so a
+                                # claimed task is always dispatched (the
+                                # admission check guaranteed a free worker).
+                                dispatch_queue.put_nowait((lease_id, *live_task))
+                                dispatched = True
+                            if notify_needed:
+                                await _notify_admission()
+                            await _publish_stats()
+                        finally:
+                            if not dispatched:
+                                await _release_lease_safely(lease_id)
+
+                    except Exception as e:
+                        logger.error(
+                            f"{queue_name}: Critical error in slot pump: {str(e)}"
+                        )
+                        await asyncio.sleep(0.1)
+            finally:
+                logger.debug(f"{queue_name}: Slot pump exiting")
+
+        async def limited_worker():
+            """Executor worker for global-limit mode.
+
+            Runs tasks handed over by the slot pump together with their
+            already-held global slot; execution/timeout/exception semantics
+            match the default worker. The lease travels with the task and is
+            always released here (or by the shutdown drain for undelivered
+            dispatch entries).
+            """
+            nonlocal executing
+            try:
+                while not shutdown_event.is_set():
+                    try:
+                        try:
+                            (
+                                lease_id,
+                                task_id,
+                                task_state,
+                                args,
+                                kwargs,
+                            ) = await asyncio.wait_for(
+                                dispatch_queue.get(), timeout=1.0
+                            )
+                        except asyncio.TimeoutError:
+                            continue
+
+                        executing += 1
+                        try:
+                            # Re-check: the task may have been cancelled in
+                            # the (tiny) window between dispatch and pickup.
+                            if (
+                                task_state.cancellation_requested
+                                or task_state.future.cancelled()
+                                or task_state.future.done()
+                            ):
+                                continue  # finally cleans up + returns slot
+
+                            if max_execution_timeout is not None:
+                                result = await asyncio.wait_for(
+                                    func(*args, **kwargs),
+                                    timeout=max_execution_timeout,
+                                )
+                            else:
+                                result = await func(*args, **kwargs)
+
+                            if not task_state.future.done():
+                                task_state.future.set_result(result)
+
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"{queue_name}: Worker timeout for task {task_id} after {max_execution_timeout}s"
+                            )
+                            if not task_state.future.done():
+                                task_state.future.set_exception(
+                                    WorkerTimeoutError(
+                                        max_execution_timeout, "execution"
+                                    )
+                                )
+                        except asyncio.CancelledError:
+                            if not task_state.future.done():
+                                task_state.future.cancel()
+                            logger.debug(
+                                f"{queue_name}: Task {task_id} cancelled during execution"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"{queue_name}: Error in decorated function for task {task_id}: {str(e)}"
+                            )
+                            if not task_state.future.done():
+                                task_state.future.set_exception(e)
+                        finally:
+                            executing -= 1
+                            worker_free.set()
+                            async with task_states_lock:
+                                task_states.pop(task_id, None)
+                            queue.task_done()
+                            await _release_lease_safely(lease_id)
+                            await _publish_stats()
+
+                    except Exception as e:
+                        logger.error(
+                            f"{queue_name}: Critical error in worker: {str(e)}"
+                        )
+                        await asyncio.sleep(0.1)
+            finally:
+                logger.debug(f"{queue_name}: Worker exiting")
+
+        def _create_worker_task() -> asyncio.Task:
+            return asyncio.create_task(
+                limited_worker() if use_global_limit else worker()
+            )
+
         async def enhanced_health_check():
             """Enhanced health check with stuck task detection and recovery"""
-            nonlocal initialized
+            nonlocal initialized, pump_task
             try:
                 while not shutdown_event.is_set():
                     await asyncio.sleep(5)  # Check every 5 seconds
 
-                    current_time = asyncio.get_event_loop().time()
+                    current_time = asyncio.get_running_loop().time()
 
                     # Detect and handle stuck tasks based on execution start time
                     if max_task_duration is not None:
@@ -874,10 +1625,22 @@ def priority_limit_async_func_call(
                         )
                         new_tasks = set()
                         for _ in range(workers_needed):
-                            task = asyncio.create_task(worker())
+                            task = _create_worker_task()
                             new_tasks.add(task)
                             task.add_done_callback(tasks.discard)
                         tasks.update(new_tasks)
+
+                    # Pump recovery: without it no slot is ever acquired and
+                    # the whole limited queue stalls.
+                    if use_global_limit and (pump_task is None or pump_task.done()):
+                        logger.warning(f"{queue_name}: Recreating dead slot pump")
+                        pump_task = asyncio.create_task(slot_pump())
+
+                    # Cross-worker upkeep: lease heartbeat / reaping, zombie
+                    # compaction, stats flush. Internally best-effort — each
+                    # step isolates its own failures so the health check
+                    # loop never exits because of shared-storage errors.
+                    await _run_maintenance()
 
             except Exception as e:
                 logger.error(f"{queue_name}: Error in enhanced health check: {str(e)}")
@@ -888,6 +1651,7 @@ def priority_limit_async_func_call(
         async def ensure_workers():
             """Ensure worker system is initialized with enhanced error handling"""
             nonlocal initialized, worker_health_check_task, tasks, reinit_count
+            nonlocal queue, use_global_limit, dispatch_queue, pump_task
 
             if initialized:
                 return
@@ -895,6 +1659,19 @@ def priority_limit_async_func_call(
             async with initialization_lock:
                 if initialized:
                     return
+
+                # Resolve the concurrency mode once (cached for the lifetime
+                # of the wrapper) and lazily create the matching queue. When
+                # shared storage is not initialized at this point (standalone
+                # usage), commit to the default unlimited path.
+                if use_global_limit is None and not _resolve_mode():
+                    use_global_limit = False
+                if queue is None:
+                    if use_global_limit:
+                        queue = asyncio.PriorityQueue()
+                        dispatch_queue = asyncio.Queue()
+                    else:
+                        queue = asyncio.PriorityQueue(maxsize=max_queue_size)
 
                 if reinit_count > 0:
                     reinit_count += 1
@@ -918,9 +1695,14 @@ def priority_limit_async_func_call(
                 # Create worker tasks
                 workers_needed = max_size - active_tasks_count
                 for _ in range(workers_needed):
-                    task = asyncio.create_task(worker())
+                    task = _create_worker_task()
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
+
+                # Start the slot pump (kept out of `tasks` so the worker
+                # recovery count never mistakes it for an executor worker).
+                if use_global_limit and (pump_task is None or pump_task.done()):
+                    pump_task = asyncio.create_task(slot_pump())
 
                 # Start enhanced health check
                 worker_health_check_task = asyncio.create_task(enhanced_health_check())
@@ -942,31 +1724,153 @@ def priority_limit_async_func_call(
                     f"{queue_name}: {workers_needed} new workers initialized {timeout_str}"
                 )
 
-        async def shutdown():
-            """Gracefully shut down all workers and cleanup resources"""
+        async def get_queue_stats():
+            """Return a best-effort snapshot of queue and worker state."""
+            async with task_states_lock:
+                running = sum(
+                    1
+                    for task_state in task_states.values()
+                    if task_state.worker_started and not task_state.future.done()
+                )
+                in_flight = len(task_states)
+
+            active_workers = len([task for task in tasks if not task.done()])
+            physical_queued = queue.qsize() if queue is not None else 0
+            stats = {
+                "queue_name": queue_name,
+                "max_async": max_size,
+                "max_queue_size": max_queue_size,
+                # Global-limit mode reports the logical queued count (live
+                # tasks only — cancelled zombies still physically present in
+                # the unbounded queue are excluded).
+                "queued": live_queued if use_global_limit else physical_queued,
+                "running": running,
+                "in_flight": in_flight,
+                "worker_count": active_workers,
+                "initialized": initialized,
+                "submitted_total": submitted_total,
+                "completed_total": completed_total,
+                "failed_total": failed_total,
+                "cancelled_total": cancelled_total,
+                "rejected_total": rejected_total,
+            }
+            if use_global_limit:
+                stats["physical_queued"] = physical_queued
+                stats["global_slot_waits"] = global_slot_waits
+            return stats
+
+        async def get_aggregated_queue_stats():
+            """Local stats merged with every worker process's published snapshot.
+
+            Publishes this process's fresh snapshot first, then sums the flat
+            counter fields across all live snapshots (schema-compatible with
+            get_queue_stats so /health consumers and the webui need no
+            changes), adding ``reporting_workers`` / ``per_worker`` and — in
+            global-limit mode — ``global_limit`` / ``global_in_use``. Any
+            shared-storage failure falls back to the local snapshot.
+            """
+            local = await get_queue_stats()
+            if not _resolve_mode() or not publish_stats:
+                return local
+            try:
+                await shared.publish_queue_stats(queue_name, _snapshot())
+                aggregated = await shared.aggregate_queue_stats(queue_name)
+                result = dict(local)
+                for field_name in shared.QUEUE_STATS_SUM_FIELDS:
+                    if field_name in aggregated:
+                        result[field_name] = aggregated[field_name]
+                result["reporting_workers"] = aggregated["reporting_workers"]
+                result["per_worker"] = aggregated["per_worker"]
+                if use_global_limit:
+                    result["global_limit"] = shared.get_global_concurrency_limit(
+                        concurrency_group
+                    )
+                    result["global_in_use"] = await shared.global_concurrency_in_use(
+                        concurrency_group
+                    )
+                    waiters = await shared.global_slot_waiters(concurrency_group)
+                    result["global_waiting_workers"] = len(waiters)
+                    result["global_longest_wait"] = (
+                        round(waiters[0]["waited"], 3) if waiters else 0.0
+                    )
+                return result
+            except Exception as e:
+                logger.debug(
+                    f"{queue_name}: queue stats aggregation failed, "
+                    f"falling back to local snapshot: {e}"
+                )
+                return local
+
+        async def shutdown(graceful: bool = True, timeout: float | None = None):
+            """Shut down workers and cleanup resources.
+
+            Graceful mode stops new submissions and drains queued/running
+            work; if the drain exceeds ``timeout`` (defaulting to
+            ``max_task_duration`` or 30s), it falls through to forced
+            cancellation so shutdown never blocks indefinitely.
+            """
+            nonlocal accepting_new_tasks, initialized, worker_health_check_task
+            nonlocal pump_task
             logger.info(f"{queue_name}: Shutting down priority queue workers")
+
+            if use_global_limit:
+                # Stop accepting and wake admission waiters inside the same
+                # Condition critical section: a request sleeping on admission
+                # (no _queue_timeout) must observe the flag flip and raise
+                # the shutdown rejection instead of sleeping forever.
+                async with admission_cond:
+                    accepting_new_tasks = False
+                    admission_cond.notify_all()
+            else:
+                accepting_new_tasks = False
+
+            drain_timed_out = False
+            if graceful and queue is not None:
+                effective_timeout = timeout
+                if effective_timeout is None:
+                    effective_timeout = (
+                        max_task_duration if max_task_duration is not None else 30.0
+                    )
+                try:
+                    await asyncio.wait_for(queue.join(), timeout=effective_timeout)
+                except asyncio.TimeoutError:
+                    drain_timed_out = True
+                    logger.warning(
+                        f"{queue_name}: Graceful drain timed out after "
+                        f"{effective_timeout}s; cancelling pending work"
+                    )
+
+            if not graceful or drain_timed_out:
+                # Cancel all active futures
+                for future in list(active_futures):
+                    if not future.done():
+                        future.cancel()
+
+                # Cancel all pending tasks
+                async with task_states_lock:
+                    for task_id, task_state in list(task_states.items()):
+                        if not task_state.future.done():
+                            task_state.future.cancel()
+                    task_states.clear()
+
+                while queue is not None:
+                    try:
+                        queue.get_nowait()
+                        queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
 
             shutdown_event.set()
 
-            # Cancel all active futures
-            for future in list(active_futures):
-                if not future.done():
-                    future.cancel()
-
-            # Cancel all pending tasks
-            async with task_states_lock:
-                for task_id, task_state in list(task_states.items()):
-                    if not task_state.future.done():
-                        task_state.future.cancel()
-                task_states.clear()
-
-            # Wait for queue to empty with timeout
-            try:
-                await asyncio.wait_for(queue.join(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"{queue_name}: Timeout waiting for queue to empty during shutdown"
-                )
+            # Cancel the slot pump first so no new dispatch entries appear
+            # while workers drain below.
+            if pump_task is not None and not pump_task.done():
+                pump_task.cancel()
+                try:
+                    await pump_task
+                except asyncio.CancelledError:
+                    pass
+            pump_task = None
 
             # Cancel worker tasks
             for task in list(tasks):
@@ -977,6 +1881,26 @@ def priority_limit_async_func_call(
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+            # Drain undelivered dispatch entries: each one was already
+            # popped from the physical queue and carries a held lease.
+            while dispatch_queue is not None:
+                try:
+                    (
+                        lease_id,
+                        task_id,
+                        task_state,
+                        _args,
+                        _kwargs,
+                    ) = dispatch_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not task_state.future.done():
+                    task_state.future.cancel()
+                async with task_states_lock:
+                    task_states.pop(task_id, None)
+                queue.task_done()
+                await _release_lease_safely(lease_id)
+
             # Cancel health check task
             if worker_health_check_task and not worker_health_check_task.done():
                 worker_health_check_task.cancel()
@@ -984,12 +1908,181 @@ def priority_limit_async_func_call(
                     await worker_health_check_task
                 except asyncio.CancelledError:
                     pass
+            worker_health_check_task = None
+            initialized = False
+
+            # Return any global slots still held (worker cancellation may
+            # have interrupted a release) and retract our published stats.
+            # Best-effort: heartbeat expiry reclaims anything left behind.
+            if use_global_limit:
+                for lease_id in list(held_leases | pending_release):
+                    held_leases.discard(lease_id)
+                    pending_release.discard(lease_id)
+                    try:
+                        await shared.release_global_slot(concurrency_group, lease_id)
+                    except Exception:
+                        pass
+                # Our workers stop polling now: drop the waiter record so
+                # this process never lingers in the longest-waiter seat
+                # (the stale TTL covers crashes where this never runs).
+                try:
+                    await shared.clear_slot_waiter(concurrency_group)
+                except Exception:
+                    pass
+            if publish_stats:
+                try:
+                    await shared.unpublish_queue_stats(queue_name)
+                except Exception:
+                    pass
 
             logger.info(f"{queue_name}: Priority queue workers shutdown complete")
 
+        async def _limited_wait(args, kwargs, _priority, _timeout, _queue_timeout):
+            """wait_func body for global-limit mode (logical admission).
+
+            Admission reserves logical capacity (live_queued) BEFORE the
+            task state is registered, with the same semantics as the bounded
+            queue in the default path: only live queued tasks count toward
+            max_queue_size (running tasks and cancelled zombies do not),
+            _queue_timeout bounds the wait with QueueFullError, and
+            max_queue_size <= 0 means unlimited admission. The reservation
+            is released exactly once — by the worker when the task turns
+            running (worker_started flip), or by the cleanup below when the
+            task dies while still queued.
+            """
+            nonlocal counter, submitted_total, completed_total, cancelled_total
+            nonlocal failed_total, rejected_total, live_queued
+
+            task_id = (
+                f"{id(asyncio.current_task())}_{asyncio.get_running_loop().time()}"
+            )
+            future = asyncio.Future()
+            task_state = TaskState(
+                future=future, start_time=asyncio.get_running_loop().time()
+            )
+
+            def _admission_open() -> bool:
+                return live_queued < max_queue_size or not accepting_new_tasks
+
+            # --- Admission: reserve capacity before registering ---
+            async with admission_cond:
+                if not accepting_new_tasks:
+                    rejected_total += 1
+                    raise RuntimeError(f"{queue_name}: Queue is shutting down")
+                if max_queue_size > 0 and live_queued >= max_queue_size:
+                    try:
+                        if _queue_timeout is not None:
+                            await asyncio.wait_for(
+                                admission_cond.wait_for(_admission_open),
+                                timeout=_queue_timeout,
+                            )
+                        else:
+                            await admission_cond.wait_for(_admission_open)
+                    except asyncio.TimeoutError:
+                        raise QueueFullError(
+                            f"{queue_name}: Queue full, timeout after {_queue_timeout} seconds"
+                        )
+                    if not accepting_new_tasks:
+                        # Woken by shutdown's notify_all.
+                        rejected_total += 1
+                        raise RuntimeError(f"{queue_name}: Queue is shutting down")
+                live_queued += 1
+
+            # Reservation window: until the task state is registered, any
+            # exception/cancellation must hand the reservation back or this
+            # slot of logical capacity would be occupied forever.
+            try:
+                async with task_states_lock:
+                    task_states[task_id] = task_state
+            except BaseException:
+                async with admission_cond:
+                    live_queued -= 1
+                    admission_cond.notify_all()
+                raise
+            # From here the reservation belongs to the exactly-once rule
+            # (worker_started transfer, or the finally cleanup below).
+
+            try:
+                active_futures.add(future)
+
+                # Get counter for FIFO ordering
+                async with initialization_lock:
+                    current_count = counter
+                    counter += 1
+
+                # Unbounded physical queue: put_nowait never blocks, and the
+                # (priority, count, ...) tuple keeps heap ordering intact.
+                queue.put_nowait((_priority, current_count, task_id, args, kwargs))
+                submitted_total += 1
+                work_available.set()
+                await _publish_stats()
+
+                # Wait for result with the same semantics as the default path
+                try:
+                    if _timeout is not None:
+                        result = await asyncio.wait_for(future, _timeout)
+                    else:
+                        result = await future
+                    completed_total += 1
+                    await _publish_stats()
+                    return result
+                except asyncio.TimeoutError:
+                    # User-level timeout: the task may still be queued (e.g.
+                    # waiting for a global slot) — mark it cancelled so no
+                    # worker ever calls the provider for it.
+                    async with task_states_lock:
+                        if task_id in task_states:
+                            task_states[task_id].cancellation_requested = True
+
+                    if not future.done():
+                        future.cancel()
+
+                    cleanup_start = asyncio.get_running_loop().time()
+                    while (
+                        task_id in task_states
+                        and asyncio.get_running_loop().time() - cleanup_start
+                        < cleanup_timeout
+                    ):
+                        await asyncio.sleep(0.1)
+
+                    cancelled_total += 1
+                    raise TimeoutError(
+                        f"{queue_name}: User timeout after {_timeout} seconds"
+                    )
+                except WorkerTimeoutError as e:
+                    failed_total += 1
+                    raise TimeoutError(f"{queue_name}: {str(e)}")
+                except HealthCheckTimeoutError as e:
+                    failed_total += 1
+                    raise TimeoutError(f"{queue_name}: {str(e)}")
+                except asyncio.CancelledError:
+                    cancelled_total += 1
+                    raise
+                except Exception:
+                    failed_total += 1
+                    raise
+
+            finally:
+                active_futures.discard(future)
+                notify_needed = False
+                async with task_states_lock:
+                    popped = task_states.pop(task_id, None)
+                    if popped is not None and not popped.worker_started:
+                        # Died while still queued: release the reservation
+                        # here — the worker never will (exactly-once).
+                        live_queued -= 1
+                        notify_needed = True
+                if notify_needed:
+                    async with admission_cond:
+                        admission_cond.notify_all()
+
         @wraps(func)
         async def wait_func(
-            *args, _priority=10, _timeout=None, _queue_timeout=None, **kwargs
+            *args,
+            _priority=DEFAULT_PROCESSING_PRIORITY,
+            _timeout=None,
+            _queue_timeout=None,
+            **kwargs,
         ):
             """
             Execute function with enhanced priority-based concurrency control and timeout handling
@@ -1009,15 +2102,28 @@ def priority_limit_async_func_call(
                 QueueFullError: If the queue is full and waiting times out
                 Any exception raised by the decorated function
             """
+            nonlocal submitted_total, completed_total, cancelled_total, failed_total
+            nonlocal rejected_total
+            if not accepting_new_tasks:
+                rejected_total += 1
+                raise RuntimeError(f"{queue_name}: Queue is shutting down")
+
             await ensure_workers()
 
+            if use_global_limit:
+                return await _limited_wait(
+                    args, kwargs, _priority, _timeout, _queue_timeout
+                )
+
             # Generate unique task ID
-            task_id = f"{id(asyncio.current_task())}_{asyncio.get_event_loop().time()}"
+            task_id = (
+                f"{id(asyncio.current_task())}_{asyncio.get_running_loop().time()}"
+            )
             future = asyncio.Future()
 
             # Create task state
             task_state = TaskState(
-                future=future, start_time=asyncio.get_event_loop().time()
+                future=future, start_time=asyncio.get_running_loop().time()
             )
 
             try:
@@ -1035,6 +2141,9 @@ def priority_limit_async_func_call(
 
                 # Queue the task with timeout handling
                 try:
+                    if not accepting_new_tasks:
+                        rejected_total += 1
+                        raise RuntimeError(f"{queue_name}: Queue is shutting down")
                     if _queue_timeout is not None:
                         await asyncio.wait_for(
                             queue.put(
@@ -1046,6 +2155,8 @@ def priority_limit_async_func_call(
                         await queue.put(
                             (_priority, current_count, task_id, args, kwargs)
                         )
+                    submitted_total += 1
+                    await _publish_stats()
                 except asyncio.TimeoutError:
                     raise QueueFullError(
                         f"{queue_name}: Queue full, timeout after {_queue_timeout} seconds"
@@ -1059,9 +2170,12 @@ def priority_limit_async_func_call(
                 # Wait for result with timeout handling
                 try:
                     if _timeout is not None:
-                        return await asyncio.wait_for(future, _timeout)
+                        result = await asyncio.wait_for(future, _timeout)
                     else:
-                        return await future
+                        result = await future
+                    completed_total += 1
+                    await _publish_stats()
+                    return result
                 except asyncio.TimeoutError:
                     # This is user-level timeout (asyncio.wait_for caused)
                     # Mark cancellation request
@@ -1074,23 +2188,32 @@ def priority_limit_async_func_call(
                         future.cancel()
 
                     # Wait for worker cleanup with timeout
-                    cleanup_start = asyncio.get_event_loop().time()
+                    cleanup_start = asyncio.get_running_loop().time()
                     while (
                         task_id in task_states
-                        and asyncio.get_event_loop().time() - cleanup_start
+                        and asyncio.get_running_loop().time() - cleanup_start
                         < cleanup_timeout
                     ):
                         await asyncio.sleep(0.1)
 
+                    cancelled_total += 1
                     raise TimeoutError(
                         f"{queue_name}: User timeout after {_timeout} seconds"
                     )
                 except WorkerTimeoutError as e:
                     # This is Worker-level timeout, directly propagate exception information
+                    failed_total += 1
                     raise TimeoutError(f"{queue_name}: {str(e)}")
                 except HealthCheckTimeoutError as e:
                     # This is Health Check-level timeout, directly propagate exception information
+                    failed_total += 1
                     raise TimeoutError(f"{queue_name}: {str(e)}")
+                except asyncio.CancelledError:
+                    cancelled_total += 1
+                    raise
+                except Exception:
+                    failed_total += 1
+                    raise
 
             finally:
                 # Ensure cleanup
@@ -1100,6 +2223,12 @@ def priority_limit_async_func_call(
 
         # Add shutdown method to decorated function
         wait_func.shutdown = shutdown
+        wait_func.get_queue_stats = get_queue_stats
+        wait_func.get_aggregated_queue_stats = get_aggregated_queue_stats
+        # One upkeep pass (lease renewal / pending releases / reaping /
+        # compaction / stats flush). The health check runs it every 5s;
+        # exposed for tests and operational tooling.
+        wait_func.run_maintenance = _run_maintenance
 
         return wait_func
 
@@ -1298,6 +2427,10 @@ def write_json(json_obj, file_name):
     making it memory-efficient. When sanitization occurs, the caller should
     reload the cleaned data from the file to update shared memory.
 
+    Writes are atomic: both the fast path and the sanitizing fallback land
+    in the same per-writer tmp sibling, and only the final ``os.replace``
+    publishes the file. A crash mid-write leaves the prior snapshot intact.
+
     Args:
         json_obj: Object to serialize (may be a shallow copy from shared memory)
         file_name: Output file path
@@ -1306,21 +2439,36 @@ def write_json(json_obj, file_name):
         bool: True if sanitization was applied (caller should reload data),
               False if direct write succeeded (no reload needed)
     """
-    try:
-        # Strategy 1: Fast path - try direct serialization
-        with open(file_name, "w", encoding="utf-8") as f:
-            json.dump(json_obj, f, indent=2, ensure_ascii=False)
-        return False  # No sanitization needed, no reload required
+    from lightrag.file_atomic import atomic_write
 
-    except (UnicodeEncodeError, UnicodeDecodeError) as e:
-        logger.debug(f"Direct JSON write failed, using sanitizing encoder: {e}")
+    sanitized = False
 
-    # Strategy 2: Use custom encoder (sanitizes during serialization, zero memory copy)
-    with open(file_name, "w", encoding="utf-8") as f:
-        json.dump(json_obj, f, indent=2, ensure_ascii=False, cls=SanitizingJSONEncoder)
+    def _do_write(tmp_path: str) -> None:
+        nonlocal sanitized
+        try:
+            # Strategy 1: Fast path - try direct serialization.
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(json_obj, f, indent=2, ensure_ascii=False)
+        except (UnicodeEncodeError, UnicodeDecodeError) as e:
+            logger.debug(f"Direct JSON write failed, using sanitizing encoder: {e}")
+            # Strategy 2: Use sanitizing encoder (zero-copy). Reusing the
+            # same tmp path keeps the operation single-rename even on the
+            # slow path.
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    json_obj,
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                    cls=SanitizingJSONEncoder,
+                )
+            sanitized = True
 
-    logger.info(f"JSON sanitization applied during write: {file_name}")
-    return True  # Sanitization applied, reload recommended
+    atomic_write(file_name, _do_write)
+
+    if sanitized:
+        logger.info(f"JSON sanitization applied during write: {file_name}")
+    return sanitized
 
 
 class TokenizerInterface(Protocol):
@@ -1363,7 +2511,24 @@ class Tokenizer:
         Returns:
             A list of integer tokens.
         """
-        return self.tokenizer.encode(content)
+        try:
+            return self.tokenizer.encode(content)
+        except ValueError as e:
+            # tiktoken (and some other tokenizers) raise ValueError when the
+            # content contains literal special-token strings such as
+            # "<|endoftext|>", because by default disallowed_special is the
+            # full set of special tokens. This crashes document indexing on
+            # any user content that happens to contain those strings — common
+            # in documentation, notes, or model output captured in source
+            # corpora. Retry with disallowed_special=() so the tokens are
+            # encoded as ordinary text. Tokenizers that don't accept the
+            # kwarg fall through and re-raise the original error.
+            if "special token" not in str(e):
+                raise
+            try:
+                return self.tokenizer.encode(content, disallowed_special=())
+            except TypeError:
+                raise e
 
     def decode(self, tokens: List[int]) -> str:
         """
@@ -1443,6 +2608,262 @@ def truncate_list_by_token_size(
         if tokens > max_token_size:
             return list_data[:i]
     return list_data
+
+
+def normalize_string_list(raw_values: Any, context: str = "") -> list[str]:
+    """Return a list of non-empty strings from raw_values.
+
+    Non-string elements are dropped and logged as warnings. If raw_values is
+    not a list, an empty list is returned.
+    """
+    if not isinstance(raw_values, list):
+        return []
+    result = []
+    for i, value in enumerate(raw_values):
+        if isinstance(value, str) and value:
+            result.append(value)
+        else:
+            logger.warning(
+                "Non-string element dropped from list%s at index %d: %r",
+                f" ({context})" if context else "",
+                i,
+                value,
+            )
+    return result
+
+
+def split_text_units_for_hard_fallback(text: str) -> list[str]:
+    """Split text into sentence/paragraph-like units for fallback chunking."""
+    if not text:
+        return []
+    units: list[str] = []
+    for para in text.split("\n\n"):
+        p = para.strip()
+        if not p:
+            continue
+        for sentence in re.split(r"(?<=[。！？；.!?])", p):
+            s = sentence.strip()
+            if s:
+                units.append(s)
+    return units if units else [text]
+
+
+def split_text_by_token_limit(
+    text: str, tokenizer: Tokenizer, max_tokens: int
+) -> list[str]:
+    """Split text by token limit with sentence-first, token-window fallback."""
+    if not text:
+        return []
+
+    try:
+        total_tokens = len(tokenizer.encode(text))
+    except Exception:
+        total_tokens = 0
+
+    if total_tokens > 0 and total_tokens <= max_tokens:
+        return [text]
+
+    units = split_text_units_for_hard_fallback(text)
+    out: list[str] = []
+    cur_parts: list[str] = []
+    cur_tokens = 0
+
+    for unit in units:
+        try:
+            unit_tokens = len(tokenizer.encode(unit))
+        except Exception:
+            unit_tokens = 0
+
+        # Sentence itself is oversize: token-window split directly.
+        if unit_tokens > max_tokens:
+            if cur_parts:
+                out.append("\n\n".join(cur_parts))
+                cur_parts = []
+                cur_tokens = 0
+
+            token_ids = tokenizer.encode(unit)
+            for start in range(0, len(token_ids), max_tokens):
+                piece = tokenizer.decode(token_ids[start : start + max_tokens]).strip()
+                if piece:
+                    out.append(piece)
+            continue
+
+        if cur_parts and cur_tokens + unit_tokens > max_tokens:
+            out.append("\n\n".join(cur_parts))
+            cur_parts = [unit]
+            cur_tokens = unit_tokens
+        else:
+            cur_parts.append(unit)
+            cur_tokens += unit_tokens
+
+    if cur_parts:
+        out.append("\n\n".join(cur_parts))
+
+    return [x for x in out if x.strip()]
+
+
+def _normalized_child_offsets(
+    parent_content: str,
+    piece: str,
+    search_from: int,
+) -> tuple[int, int] | None:
+    """Locate ``piece`` in ``parent_content`` ignoring all whitespace.
+
+    Returns ``(start, end)`` char offsets into ``parent_content`` for the first
+    whitespace-stripped occurrence at/after ``search_from``, or ``None`` if absent.
+    Removing every whitespace char (not collapsing runs) keeps the match exact even
+    when the two sides space the same characters differently — the same monotonic
+    projection :mod:`lightrag.sidecar.backfill` uses.
+    """
+    norm_piece = "".join(piece.split())
+    if not norm_piece:
+        return None
+    norm_chars: list[str] = []
+    norm_to_orig: list[int] = []
+    for idx, ch in enumerate(parent_content):
+        if ch.isspace():
+            continue
+        norm_chars.append(ch)
+        norm_to_orig.append(idx)
+    norm_parent = "".join(norm_chars)
+    # First normalized index whose source offset is >= search_from (norm_to_orig is
+    # strictly increasing), so repeated pieces resolve forward in order.
+    norm_start = bisect.bisect_left(norm_to_orig, search_from)
+    pos = norm_parent.find(norm_piece, norm_start)
+    if pos < 0:
+        return None
+    o_start = norm_to_orig[pos]
+    o_end = norm_to_orig[pos + len(norm_piece) - 1] + 1
+    return o_start, o_end
+
+
+def _child_source_span(
+    parent_content: str,
+    parent_span: Any,
+    piece: str,
+    search_from: int,
+) -> tuple[dict[str, int] | None, int]:
+    """Locate a hard-split child ``piece`` inside its parent's source span.
+
+    Pieces are usually verbatim substrings of ``parent_content`` (token-window
+    slices), so an exact forward ``find`` resolves them precisely. But
+    :func:`split_text_by_token_limit` rejoins multiple sentence units with
+    ``"\\n\\n"``, so a multi-unit piece is *not* byte-verbatim when the source
+    separated those sentences with a single space/newline. In that case we fall
+    back to a whitespace-stripped match (the same projection sidecar backfill uses),
+    which stays exact because whitespace removal is monotonic. Without this fallback
+    the child would lose its span and sidecar backfill would wrongly FAIL the
+    document.
+
+    Returns ``(span | None, next_search_from)`` where ``next_search_from`` is a
+    ``parent_content`` offset threaded forward by the caller so repeated pieces
+    resolve in order.
+    """
+    if not isinstance(parent_span, dict):
+        return None, search_from
+    try:
+        parent_start = int(parent_span["start"])
+        parent_end = int(parent_span["end"])
+    except (KeyError, TypeError, ValueError):
+        return None, search_from
+    if parent_start < 0 or parent_end < parent_start:
+        return None, search_from
+
+    search_from = max(0, search_from)
+
+    # Exact: verbatim token-window pieces.
+    local_start = parent_content.find(piece, search_from)
+    if local_start >= 0:
+        local_end = local_start + len(piece)
+    else:
+        # Whitespace-normalized fallback: multi-unit pieces rejoined with "\n\n".
+        offsets = _normalized_child_offsets(parent_content, piece, search_from)
+        if offsets is None:
+            return None, search_from
+        local_start, local_end = offsets
+
+    if parent_start + local_end > parent_end:
+        return None, search_from
+    return (
+        {"start": parent_start + local_start, "end": parent_start + local_end},
+        local_end,
+    )
+
+
+def enforce_chunk_token_limit_before_embedding(
+    chunking_result: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    tokenizer: Tokenizer,
+    max_tokens: int,
+) -> list[dict[str, Any]]:
+    """Hard fallback split before embedding while preserving heading hierarchy."""
+    if max_tokens <= 0:
+        return list(chunking_result)
+
+    normalized: list[dict[str, Any]] = []
+
+    for dp in chunking_result:
+        if not isinstance(dp, dict):
+            continue
+
+        content = dp.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            continue
+
+        try:
+            token_count = len(tokenizer.encode(content))
+        except Exception:
+            token_count = (
+                dp.get("tokens", 0) if isinstance(dp.get("tokens"), int) else 0
+            )
+
+        if token_count <= max_tokens:
+            ndp = dict(dp)
+            ndp["tokens"] = token_count if token_count > 0 else ndp.get("tokens", 0)
+            normalized.append(ndp)
+            continue
+
+        pieces = split_text_by_token_limit(content, tokenizer, max_tokens)
+        if not pieces:
+            ndp = dict(dp)
+            ndp["tokens"] = token_count
+            normalized.append(ndp)
+            continue
+
+        base_chunk_id = dp.get("chunk_id")
+        parent_span = dp.get("_source_span")
+        span_search_from = 0
+        total_parts = len(pieces)
+        for i, piece in enumerate(pieces, 1):
+            new_dp = dict(dp)
+            new_dp["content"] = piece
+            try:
+                new_dp["tokens"] = len(tokenizer.encode(piece))
+            except Exception:
+                new_dp["tokens"] = max(1, int(len(piece) * 0.5))
+
+            # Shallow-copy preserves the nested heading dict and sidecar
+            # block from the source chunk; only the payload (content/tokens
+            # /chunk_id) is rewritten per split slice.
+            if isinstance(base_chunk_id, str) and base_chunk_id.strip():
+                new_dp["chunk_id"] = f"{base_chunk_id}-s{i:02d}"
+
+            child_span, span_search_from = _child_source_span(
+                content, parent_span, piece, span_search_from
+            )
+            if child_span is not None:
+                new_dp["_source_span"] = child_span
+            elif "_source_span" in new_dp:
+                new_dp.pop("_source_span", None)
+
+            new_dp["split_type"] = "hard_fallback"
+            new_dp["split_part"] = i
+            new_dp["split_total"] = total_parts
+            normalized.append(new_dp)
+
+    # Rebuild order index to keep continuity after splitting.
+    for idx, item in enumerate(normalized):
+        item["chunk_order_index"] = idx
+    return normalized
 
 
 def cosine_similarity(v1, v2):
@@ -1590,25 +3011,38 @@ def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
     """
     Ensure that there is always an event loop available.
 
-    This function tries to get the current event loop. If the current event loop is closed or does not exist,
-    it creates a new event loop and sets it as the current event loop.
+    Reuses the loop running on (or installed on) the current thread so that
+    repeated synchronous calls share a single loop; if none exists or it is
+    closed, creates a new one and installs it as the current loop.
 
     Returns:
         asyncio.AbstractEventLoop: The current or newly created event loop.
     """
+    # Reuse a loop actively running on this thread.
     try:
-        # Try to get the current event loop
-        current_loop = asyncio.get_event_loop()
-        if current_loop.is_closed():
-            raise RuntimeError("Event loop is closed.")
-        return current_loop
-
+        return asyncio.get_running_loop()
     except RuntimeError:
-        # If no event loop exists or it is closed, create a new one
-        logger.info("Creating a new event loop in main thread.")
-        new_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(new_loop)
-        return new_loop
+        pass
+
+    # Reuse a loop already installed on this thread, but never let
+    # asyncio.get_event_loop() lazily auto-create one — on Python 3.12+ that
+    # emits a DeprecationWarning. Promote that warning to an error so the
+    # "no current loop" case falls through to explicit creation below, while a
+    # genuinely installed (open) loop is still returned and reused.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        try:
+            current_loop = asyncio.get_event_loop()
+            if not current_loop.is_closed():
+                return current_loop
+        except (RuntimeError, DeprecationWarning):
+            pass
+
+    # No usable loop on this thread — create one and install it.
+    logger.info("Creating a new event loop in main thread.")
+    new_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(new_loop)
+    return new_loop
 
 
 async def aexport_data(
@@ -2045,6 +3479,9 @@ async def use_llm_func_with_cache(
     cache_type: str = "extract",
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
+    response_format: Any | None = None,
+    entity_extraction: bool = False,
+    llm_cache_identity: Any | None = None,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -2063,12 +3500,33 @@ async def use_llm_func_with_cache(
         chunk_id: Chunk identifier to store in cache
         text_chunks_storage: Text chunks storage to update llm_cache_list
         cache_keys_collector: Optional list to collect cache keys for batch processing
+        response_format: Structured output control forwarded to the LLM provider.
+            Providers translate this to their native structured-output surface
+            (OpenAI response_format, Ollama format, Gemini response_mime_type/schema).
+            ``{"type": "json_object"}`` requests JSON output; typed/schema payloads
+            trigger schema-constrained output where supported; ``None`` leaves
+            output unconstrained. Providers that do not support structured output
+            safely strip this argument.
+        entity_extraction: Deprecated. When True and ``response_format`` is not
+            provided, maps to ``{"type": "json_object"}``. Prefer passing
+            ``response_format`` directly.
+        llm_cache_identity: Non-secret model/provider identity used to partition
+            cache entries across role model, binding, or host changes.
 
     Returns:
         tuple[str, int]: (LLM response text, timestamp)
             - For cache hits: (content, cache_create_time)
             - For cache misses: (content, current_timestamp)
     """
+    if entity_extraction and response_format is None:
+        warnings.warn(
+            "use_llm_func_with_cache(entity_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        response_format = {"type": "json_object"}
+    _validate_cached_response_format(response_format)
     # Sanitize input text to prevent UTF-8 encoding errors for all LLM providers
     safe_user_prompt = sanitize_text_for_encoding(user_prompt)
     safe_system_prompt = (
@@ -2098,7 +3556,15 @@ async def use_llm_func_with_cache(
             prompt_parts.append(history)
         _prompt = "\n".join(prompt_parts)
 
-        arg_hash = compute_args_hash(_prompt)
+        response_format_key = _serialize_cache_variant(response_format)
+        llm_identity_key = serialize_llm_cache_identity(llm_cache_identity)
+        arg_hash = compute_args_hash(
+            _prompt,
+            "\n<response_format>\n",
+            response_format_key,
+            "\n<llm_identity>\n",
+            llm_identity_key,
+        )
         # Generate cache key for this LLM call
         cache_key = generate_cache_key("default", cache_type, arg_hash)
 
@@ -2127,6 +3593,8 @@ async def use_llm_func_with_cache(
             kwargs["history_messages"] = safe_history_messages
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if response_format is not None:
+            kwargs["response_format"] = response_format
 
         res: str = await use_llm_func(
             safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
@@ -2161,6 +3629,8 @@ async def use_llm_func_with_cache(
         kwargs["history_messages"] = safe_history_messages
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if response_format is not None:
+        kwargs["response_format"] = response_format
 
     try:
         res = await use_llm_func(
@@ -2385,6 +3855,116 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
     text = _CONTROL_CHAR_PATTERN_ALL.sub(replacement_char, text)
 
     return text.strip()
+
+
+def strip_control_characters(text: str, replacement_char: str = "") -> str:
+    """Remove control/separator chars and surrogates while preserving text.
+
+    Strips the same character classes as :func:`sanitize_text_for_encoding`
+    (surrogates via ``_SURROGATE_PATTERN`` and control chars via
+    ``_CONTROL_CHAR_PATTERN_ALL`` — including the C0 separators ``\\x1c``-``\\x1f``
+    FS/GS/RS/US, while keeping ``\\t``/``\\n``/``\\r``) but deliberately does
+    *not* ``html.unescape`` or ``.strip()`` the result.
+
+    This makes it safe for text that carries intentional markup (e.g. sidecar
+    block content with ``<table>``/``<drawing>``/``<equation>`` tags, where
+    unescaping ``&lt;`` would corrupt the markup) or significant leading/
+    trailing whitespace. For control-char-free input it returns the string
+    unchanged, so it does not perturb existing content hashes or snapshots.
+    """
+    if not text:
+        return text
+    text = _SURROGATE_PATTERN.sub(replacement_char, text)
+    return _CONTROL_CHAR_PATTERN_ALL.sub(replacement_char, text)
+
+
+# LLMs emitting LaTeX inside JSON strings routinely under-escape backslashes:
+# "\frac" is *valid* JSON meaning form feed + "rac", so JSON parsers
+# (including json_repair) silently decode it and the LaTeX command is
+# destroyed. Form feed (\x0c) and backspace (\x08) followed by a letter have
+# no legitimate use in LLM-generated prose, so restoring the backslash is
+# unconditionally safe. The other three decodable escapes (\t, \n, \r) map to
+# legitimate whitespace and cannot be restored without guessing; they are only
+# *detected* (see _WS_LATEX_SUSPECT_PATTERN) so real-world frequency can be
+# observed before deciding on heuristic restoration.
+_FORMFEED_LATEX_PATTERN = re.compile(r"\x0c(?=[A-Za-z])")
+_BACKSPACE_LATEX_PATTERN = re.compile(r"\x08(?=[A-Za-z])")
+# Whitespace + residue spelling that completes a common LaTeX command whose
+# remainder collides with no English word ("eq"/"o"/"exists" are deliberately
+# absent: "eq." abbreviations, the word "o"/"exists" would false-positive).
+_WS_LATEX_SUSPECT_PATTERN = re.compile(
+    r"\t(?=(?:au|heta|imes|ext|ilde|herefore|riangle)\b)"
+    r"|\r(?=(?:ho|ight|angle|ceil)\b)"
+    r"|\n(?=(?:abla|otin)\b)"
+)
+
+
+def repair_vlm_json_escape_damage(text: str, *, context: str = "") -> str:
+    """Restore LaTeX backslashes destroyed by JSON escape decoding.
+
+    Applied to string values parsed out of VLM/LLM JSON responses, where an
+    un-doubled LaTeX command like ``"\\frac"`` arrives as ``\\x0c`` + ``rac``.
+    Only the two zero-risk cases are repaired:
+
+    - form feed + letter  -> ``\\f`` + letter (``\\frac``, ``\\forall``, ...)
+    - backspace + letter  -> ``\\b`` + letter (``\\beta``, ``\\bar``, ...)
+
+    Isolated control characters (not followed by a letter) are left alone for
+    downstream sanitization to drop. Whitespace-class damage (``\\tau`` ->
+    tab + ``au`` etc.) is ambiguous with legitimate whitespace and is only
+    logged at WARNING level, never rewritten.
+
+    Args:
+        text: Parsed string value to repair.
+        context: Optional label (e.g. ``"table/t1.description"``) included in
+            the detection log line.
+    """
+    if not text:
+        return text
+
+    repaired = _FORMFEED_LATEX_PATTERN.sub(r"\\f", text)
+    repaired = _BACKSPACE_LATEX_PATTERN.sub(r"\\b", repaired)
+    if repaired != text:
+        logger.warning(
+            "Repaired LaTeX escape damage (\\f/\\b decoded by JSON parser)%s",
+            f" in {context}" if context else "",
+        )
+
+    suspect = _WS_LATEX_SUSPECT_PATTERN.search(repaired)
+    if suspect:
+        snippet = repaired[max(0, suspect.start() - 30) : suspect.start() + 30]
+        logger.warning(
+            "Suspected whitespace-class LaTeX escape damage%s (not auto-repaired): %r",
+            f" in {context}" if context else "",
+            snippet,
+        )
+
+    return repaired
+
+
+def repair_vlm_json_escape_damage_nested(obj: Any, *, context: str = "") -> Any:
+    """Apply :func:`repair_vlm_json_escape_damage` to every string inside a
+    parsed JSON structure (dicts / lists nested arbitrarily).
+
+    Used on the output of ``json_repair.loads`` for LLM responses that may
+    quote LaTeX — multimodal analysis objects and entity-extraction results
+    (``{"entities": [{...}], "relationships": [{...}]}``). Non-string leaves
+    are returned untouched.
+    """
+    if isinstance(obj, str):
+        return repair_vlm_json_escape_damage(obj, context=context)
+    if isinstance(obj, dict):
+        return {
+            key: repair_vlm_json_escape_damage_nested(
+                value, context=f"{context}.{key}" if context else str(key)
+            )
+            for key, value in obj.items()
+        }
+    if isinstance(obj, list):
+        return [
+            repair_vlm_json_escape_damage_nested(item, context=context) for item in obj
+        ]
+    return obj
 
 
 def check_storage_env_vars(storage_name: str) -> None:
@@ -3205,10 +4785,18 @@ def create_prefixed_exception(original_exception: Exception, prefix: str) -> Exc
         else:
             # Method 2: If no args, try single parameter construction.
             return type(original_exception)(f"{prefix}: {str(original_exception)}")
-    except (TypeError, ValueError, AttributeError):
-        # Method 3: If reconstruction fails, wrap it in a RuntimeError.
-        # This is the safest fallback, as attempting to create the same type
-        # with a single string can fail if the constructor requires multiple arguments.
+    except Exception:
+        # Method 3: If reconstruction fails for any reason, wrap it in a
+        # RuntimeError preserving the original type name and message. This is a
+        # defensive catch-all: most known failures already surface as TypeError
+        # (e.g. json.JSONDecodeError needs (msg, doc, pos) and
+        # openai.APIStatusError/BadRequestError need keyword-only
+        # (response, body), so rebuilding from args alone raises TypeError), but
+        # an exotic constructor could raise something else (KeyError, a
+        # validation error, ...). Catching `Exception` guarantees this helper
+        # never raises while prefixing — `KeyboardInterrupt`/`SystemExit` are
+        # BaseException and still propagate. The original exception and its full
+        # traceback are preserved by the caller's `raise ... from original`.
         return RuntimeError(
             f"{prefix}: {type(original_exception).__name__}: {str(original_exception)}"
         )
@@ -3402,3 +4990,44 @@ def generate_reference_list_from_chunks(
         reference_list.append({"reference_id": str(i + 1), "file_path": file_path})
 
     return reference_list, updated_chunks
+
+
+def validate_workspace(workspace: str) -> str:
+    """Validate a workspace name used to build per-workspace directories.
+
+    File-based storages place their data in a subdirectory named after the
+    workspace under ``working_dir`` (``os.path.join(working_dir, workspace)``).
+    To prevent path traversal, the workspace must be a single path component:
+    it may not contain a path separator nor be a relative path reference.
+
+    Unlike a sanitizing approach, this validator does not rewrite the name.
+    Legitimate names containing dots (e.g. ``"v1.0"``) are accepted unchanged,
+    while unsafe names are rejected so the caller fails fast instead of
+    silently reading or writing outside the intended directory.
+
+    Args:
+        workspace: Workspace name from configuration or environment variables.
+
+    Returns:
+        The workspace name unchanged when it is valid.
+
+    Raises:
+        ValueError: If the workspace contains ``/`` or ``\\``, or is ``"."`` or
+            ``".."``.
+
+    Examples:
+        >>> validate_workspace("my_workspace")
+        'my_workspace'
+        >>> validate_workspace("v1.0")
+        'v1.0'
+        >>> validate_workspace("../../../etc")
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid workspace name '../../../etc': must not contain path separators ('/', '\\') or be a relative path reference ('.', '..')
+    """
+    if "/" in workspace or "\\" in workspace or workspace in (".", ".."):
+        raise ValueError(
+            f"Invalid workspace name {workspace!r}: must not contain path "
+            "separators ('/', '\\') or be a relative path reference ('.', '..')"
+        )
+    return workspace

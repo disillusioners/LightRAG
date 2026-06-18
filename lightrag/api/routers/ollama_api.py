@@ -9,6 +9,7 @@ import re
 from enum import Enum
 import asyncio
 from lightrag import QueryParam
+from lightrag.constants import DEFAULT_QUERY_PRIORITY
 from lightrag.utils import TiktokenTokenizer
 from lightrag.api.utils_api import get_combined_auth_dependency
 from fastapi import Depends
@@ -321,20 +322,135 @@ class OllamaAPI:
             rag = await self.workspace_mgr.get_or_create(workspace)
 
             try:
+                role_kwargs = (
+                    dict(rag.role_llm_kwargs["query"])
+                    if rag.role_llm_kwargs["query"] is not None
+                    else dict(rag.llm_model_kwargs)
+                )
+                if request.system:
+                    role_kwargs["system_prompt"] = request.system
+
                 infos = rag.ollama_server_infos
 
                 if request.stream:
-                    # Generator's finally handles release
+                    response = await (rag.role_llm_funcs["query"])(
+                        query,
+                        stream=True,
+                        _priority=DEFAULT_QUERY_PRIORITY,
+                        **role_kwargs,
+                    )
+
+                    async def stream_generator():
+                        first_chunk_time = None
+                        last_chunk_time = time.time_ns()
+                        total_response = ""
+
+                        # Ensure response is an async generator
+                        if isinstance(response, str):
+                            # If it's a string, send in two parts
+                            first_chunk_time = start_time
+                            last_chunk_time = time.time_ns()
+                            total_response = response
+
+                            data = {
+                                "model": rag.ollama_server_infos.LIGHTRAG_MODEL,
+                                "created_at": rag.ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                "response": response,
+                                "done": False,
+                            }
+                            yield f"{json.dumps(data, ensure_ascii=False)}\n"
+
+                            completion_tokens = estimate_tokens(total_response)
+                            total_time = last_chunk_time - start_time
+                            prompt_eval_time = first_chunk_time - start_time
+                            eval_time = last_chunk_time - first_chunk_time
+
+                            data = {
+                                "model": rag.ollama_server_infos.LIGHTRAG_MODEL,
+                                "created_at": rag.ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                "response": "",
+                                "done": True,
+                                "done_reason": "stop",
+                                "context": [],
+                                "total_duration": total_time,
+                                "load_duration": 0,
+                                "prompt_eval_count": prompt_tokens,
+                                "prompt_eval_duration": prompt_eval_time,
+                                "eval_count": completion_tokens,
+                                "eval_duration": eval_time,
+                            }
+                            yield f"{json.dumps(data, ensure_ascii=False)}\n"
+                        else:
+                            try:
+                                async for chunk in response:
+                                    if chunk:
+                                        if first_chunk_time is None:
+                                            first_chunk_time = time.time_ns()
+
+                                        last_chunk_time = time.time_ns()
+
+                                        total_response += chunk
+                                        data = {
+                                            "model": rag.ollama_server_infos.LIGHTRAG_MODEL,
+                                            "created_at": rag.ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                            "response": chunk,
+                                            "done": False,
+                                        }
+                                        yield f"{json.dumps(data, ensure_ascii=False)}\n"
+                            except (asyncio.CancelledError, Exception) as e:
+                                error_msg = str(e)
+                                if isinstance(e, asyncio.CancelledError):
+                                    error_msg = "Stream was cancelled by server"
+                                else:
+                                    error_msg = f"Provider error: {error_msg}"
+
+                                logger.error(f"Stream error: {error_msg}")
+
+                                # Send error message to client
+                                error_data = {
+                                    "model": rag.ollama_server_infos.LIGHTRAG_MODEL,
+                                    "created_at": rag.ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                    "response": f"\n\nError: {error_msg}",
+                                    "error": f"\n\nError: {error_msg}",
+                                    "done": False,
+                                }
+                                yield f"{json.dumps(error_data, ensure_ascii=False)}\n"
+
+                                # Send final message to close the stream
+                                final_data = {
+                                    "model": rag.ollama_server_infos.LIGHTRAG_MODEL,
+                                    "created_at": rag.ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                    "response": "",
+                                    "done": True,
+                                }
+                                yield f"{json.dumps(final_data, ensure_ascii=False)}\n"
+                                return
+                            if first_chunk_time is None:
+                                first_chunk_time = start_time
+                            completion_tokens = estimate_tokens(total_response)
+                            total_time = last_chunk_time - start_time
+                            prompt_eval_time = first_chunk_time - start_time
+                            eval_time = last_chunk_time - first_chunk_time
+
+                            data = {
+                                "model": rag.ollama_server_infos.LIGHTRAG_MODEL,
+                                "created_at": rag.ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                "response": "",
+                                "done": True,
+                                "done_reason": "stop",
+                                "context": [],
+                                "total_duration": total_time,
+                                "load_duration": 0,
+                                "prompt_eval_count": prompt_tokens,
+                                "prompt_eval_duration": prompt_eval_time,
+                                "eval_count": completion_tokens,
+                                "eval_duration": eval_time,
+                            }
+                            yield f"{json.dumps(data, ensure_ascii=False)}\n"
+                            return
+
                     return StreamingResponse(
-                        self._stream_generate(
-                            workspace,
-                            rag,
-                            infos,
-                            request,
-                            query,
-                            start_time,
-                            prompt_tokens,
-                        ),
+                        stream_generator(),
                         media_type="application/x-ndjson",
                         headers={
                             "Cache-Control": "no-cache",
@@ -346,15 +462,11 @@ class OllamaAPI:
                 else:
                     try:
                         first_chunk_time = time.time_ns()
-                        if request.system:
-                            kwargs = {
-                                **rag.llm_model_kwargs,
-                                "system_prompt": request.system,
-                            }
-                        else:
-                            kwargs = rag.llm_model_kwargs
-                        response_text = await rag.llm_model_func(
-                            query, stream=False, **kwargs
+                        response_text = await (rag.role_llm_funcs["query"])(
+                            query,
+                            stream=False,
+                            _priority=DEFAULT_QUERY_PRIORITY,
+                            **role_kwargs,
                         )
                         last_chunk_time = time.time_ns()
 
@@ -448,14 +560,19 @@ class OllamaAPI:
                 if request.stream:
                     # Determine if the request is prefix with "/bypass"
                     if mode == SearchMode.bypass:
-                        system_prompt = request.system
-                        response = await rag.llm_model_func(
+                        role_kwargs = (
+                            dict(rag.role_llm_kwargs["query"])
+                            if rag.role_llm_kwargs["query"] is not None
+                            else dict(rag.llm_model_kwargs)
+                        )
+                        if request.system:
+                            role_kwargs["system_prompt"] = request.system
+                        response = await (rag.role_llm_funcs["query"])(
                             cleaned_query,
                             stream=True,
                             history_messages=conversation_history,
-                            **{**rag.llm_model_kwargs, "system_prompt": system_prompt}
-                            if system_prompt
-                            else rag.llm_model_kwargs,
+                            _priority=DEFAULT_QUERY_PRIORITY,
+                            **role_kwargs,
                         )
                     else:
                         response = await rag.aquery(cleaned_query, param=query_param)
@@ -492,18 +609,20 @@ class OllamaAPI:
                             r"\n<chat_history>\nUSER:", cleaned_query, re.MULTILINE
                         )
                         if match_result or mode == SearchMode.bypass:
+                            role_kwargs = (
+                                dict(rag.role_llm_kwargs["query"])
+                                if rag.role_llm_kwargs["query"] is not None
+                                else dict(rag.llm_model_kwargs)
+                            )
                             if request.system:
-                                kwargs = {
-                                    **rag.llm_model_kwargs,
-                                    "system_prompt": request.system,
-                                }
-                            else:
-                                kwargs = rag.llm_model_kwargs
-                            response_text = await rag.llm_model_func(
+                                role_kwargs["system_prompt"] = request.system
+
+                            response_text = await (rag.role_llm_funcs["query"])(
                                 cleaned_query,
                                 stream=False,
                                 history_messages=conversation_history,
-                                **kwargs,
+                                _priority=DEFAULT_QUERY_PRIORITY,
+                                **role_kwargs,
                             )
                         else:
                             response_text = await rag.aquery(

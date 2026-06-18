@@ -105,8 +105,8 @@ class QueryRequest(BaseModel):
     )
 
     stream: Optional[bool] = Field(
-        default=True,
-        description="If True, enables streaming output for real-time responses. Only affects /query/stream endpoint.",
+        default=None,
+        description="If True, enables streaming output. Defaults to False for /query, True for /query/stream.",
     )
 
     @field_validator("query", mode="after")
@@ -330,9 +330,6 @@ def create_query_routes(workspace_mgr, api_key: Optional[str] = None, top_k: int
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
-        This endpoint performs Retrieval-Augmented Generation (RAG) queries using various modes
-        to provide intelligent responses based on your knowledge base.
-
         **Query Modes:**
         - **local**: Focuses on specific entities and their direct relationships
         - **global**: Analyzes broader patterns and relationships across the knowledge graph
@@ -413,7 +410,6 @@ def create_query_routes(workspace_mgr, api_key: Optional[str] = None, top_k: int
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
-
             # Unified approach: always use aquery_llm for both cases
             result = await rag.aquery_llm(request.query, param=param)
 
@@ -460,6 +456,70 @@ def create_query_routes(workspace_mgr, api_key: Optional[str] = None, top_k: int
             raise HTTPException(status_code=500, detail=str(e))
         finally:
             workspace_mgr.release(workspace)
+
+    def _build_stream_generator(
+        *,
+        result: dict[str, Any],
+        include_references: bool,
+        include_chunk_content: bool,
+    ):
+        """Shared async generator that yields NDJSON lines for streaming responses.
+
+        Used by ``/query/stream`` to format NDJSON output with consistent
+        error-handling behaviour.
+        """
+
+        async def _generate():
+            references = result.get("data", {}).get("references", [])
+            llm_response = result.get("llm_response", {})
+
+            # Enrich references with chunk content if requested
+            if include_references and include_chunk_content:
+                data = result.get("data", {})
+                chunks = data.get("chunks", [])
+                ref_id_to_content: dict[str, list[str]] = {}
+                for chunk in chunks:
+                    ref_id = chunk.get("reference_id", "")
+                    content = chunk.get("content", "")
+                    if ref_id and content:
+                        ref_id_to_content.setdefault(ref_id, []).append(content)
+
+                enriched_references = []
+                for ref in references:
+                    ref_copy = ref.copy()
+                    ref_id = ref.get("reference_id", "")
+                    if ref_id in ref_id_to_content:
+                        ref_copy["content"] = ref_id_to_content[ref_id]
+                    enriched_references.append(ref_copy)
+                references = enriched_references
+
+            if llm_response.get("is_streaming"):
+                # Streaming: references first, then response chunks
+                if include_references:
+                    yield f"{json.dumps({'references': references})}\n"
+
+                response_stream = llm_response.get("response_iterator")
+                if response_stream:
+                    try:
+                        async for chunk in response_stream:
+                            if chunk:
+                                yield f"{json.dumps({'response': chunk})}\n"
+                    except Exception as e:
+                        logger.error(f"Streaming error: {str(e)}")
+                        yield f"{json.dumps({'error': str(e)})}\n"
+            else:
+                # Non-streaming: complete response in one message
+                response_content = llm_response.get("content", "")
+                if not response_content:
+                    response_content = "No relevant context found for the query."
+
+                complete_response = {"response": response_content}
+                if include_references:
+                    complete_response["references"] = references
+
+                yield f"{json.dumps(complete_response)}\n"
+
+        return _generate
 
     @router.post(
         "/query/stream",
@@ -675,74 +735,30 @@ def create_query_routes(workspace_mgr, api_key: Optional[str] = None, top_k: int
         stream_mode = request.stream if request.stream is not None else True
         param = request.to_query_params(stream_mode)
 
-        # Call aquery_llm here (before returning StreamingResponse)
-        result = await rag.aquery_llm(request.query, param=param)
+        try:
+            # Unified approach: always use aquery_llm for all cases
+            result = await rag.aquery_llm(request.query, param=param)
+            stream_gen = _build_stream_generator(
+                result=result,
+                include_references=request.include_references,
+                include_chunk_content=request.include_chunk_content,
+            )
 
-        # Extract what we need before returning StreamingResponse
-        references = result.get("data", {}).get("references", [])
-        llm_response = result.get("llm_response", {})
-        is_streaming = llm_response.get("is_streaming", False)
-
-        # Enrich references with chunk content if requested
-        if request.include_references and request.include_chunk_content:
-            data = result.get("data", {})
-            chunks = data.get("chunks", [])
-            ref_id_to_content = {}
-            for chunk in chunks:
-                ref_id = chunk.get("reference_id", "")
-                content = chunk.get("content", "")
-                if ref_id and content:
-                    ref_id_to_content.setdefault(ref_id, []).append(content)
-
-            enriched_references = []
-            for ref in references:
-                ref_copy = ref.copy()
-                ref_id = ref.get("reference_id", "")
-                if ref_id in ref_id_to_content:
-                    ref_copy["content"] = ref_id_to_content[ref_id]
-                enriched_references.append(ref_copy)
-            references = enriched_references
-
-        async def stream_generator():
-            try:
-                if is_streaming:
-                    # Streaming mode: send references first, then stream response chunks
-                    if request.include_references:
-                        yield f"{json.dumps({'references': references})}\n"
-
-                    response_stream = llm_response.get("response_iterator")
-                    if response_stream:
-                        try:
-                            async for chunk in response_stream:
-                                if chunk:
-                                    yield f"{json.dumps({'response': chunk})}\n"
-                        except Exception as e:
-                            logger.error(f"Streaming error: {str(e)}")
-                            yield f"{json.dumps({'error': str(e)})}\n"
-                else:
-                    # Non-streaming mode: send complete response in one message
-                    response_content = llm_response.get("content", "")
-                    if not response_content:
-                        response_content = "No relevant context found for the query."
-
-                    complete_response = {"response": response_content}
-                    if request.include_references:
-                        complete_response["references"] = references
-
-                    yield f"{json.dumps(complete_response)}\n"
-            finally:
-                workspace_mgr.release(workspace)
-
-        return StreamingResponse(
-            stream_generator(),
-            media_type="application/x-ndjson",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Content-Type": "application/x-ndjson",
-                "X-Accel-Buffering": "no",
-            },
-        )
+            return StreamingResponse(
+                stream_gen(),
+                media_type="application/x-ndjson",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Content-Type": "application/x-ndjson",
+                    "X-Accel-Buffering": "no",  # Ensure proper handling of streaming response when proxied by Nginx
+                },
+            )
+        except Exception as e:
+            logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            workspace_mgr.release(workspace)
 
     @router.post(
         "/query/data",
