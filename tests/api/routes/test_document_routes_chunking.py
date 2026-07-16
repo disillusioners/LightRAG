@@ -45,6 +45,8 @@ from lightrag.constants import (  # noqa: E402
 )
 from lightrag.parser.routing import default_chunker_config  # noqa: E402
 
+from tests.api.routes._fake_workspace_manager import FakeWorkspaceManager  # noqa: E402
+
 pytestmark = pytest.mark.offline
 
 _ALL_STRATEGY_KEYS = {
@@ -479,7 +481,9 @@ def _make_client(monkeypatch, addon_params=None):
 
     app = FastAPI()
     app.include_router(
-        create_document_routes(rag, SimpleNamespace(), api_key="test-key")
+        create_document_routes(
+            FakeWorkspaceManager(rag), SimpleNamespace(), api_key="test-key"
+        )
     )
     return TestClient(app), captured
 

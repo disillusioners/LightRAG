@@ -39,6 +39,10 @@ create_graph_routes = _graph_routes.create_graph_routes
 create_document_routes = _document_routes.create_document_routes
 check_pipeline_busy_or_raise = _document_routes.check_pipeline_busy_or_raise
 
+from tests.api.routes._fake_workspace_manager import (  # noqa: E402
+    FakeWorkspaceManager,
+)
+
 pytestmark = pytest.mark.offline
 
 _API_KEY = "test-key"
@@ -94,8 +98,12 @@ def _make_mock_rag() -> SimpleNamespace:
 
 def _build_client(rag: SimpleNamespace) -> TestClient:
     app = FastAPI()
-    app.include_router(create_graph_routes(rag, api_key=_API_KEY))
-    app.include_router(create_document_routes(rag, SimpleNamespace(), api_key=_API_KEY))
+    app.include_router(create_graph_routes(FakeWorkspaceManager(rag), api_key=_API_KEY))
+    app.include_router(
+        create_document_routes(
+            FakeWorkspaceManager(rag), SimpleNamespace(), api_key=_API_KEY
+        )
+    )
     return TestClient(app)
 
 

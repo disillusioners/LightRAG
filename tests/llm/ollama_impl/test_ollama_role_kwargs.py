@@ -8,6 +8,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.api.routes._fake_workspace_manager import FakeWorkspaceManager
+
 
 pytestmark = pytest.mark.offline
 
@@ -55,7 +57,7 @@ def _make_client(monkeypatch) -> tuple[TestClient, _FakeRag]:
     ollama_api_module = importlib.import_module("lightrag.api.routers.ollama_api")
     OllamaAPI = ollama_api_module.OllamaAPI
     rag = _FakeRag()
-    api = OllamaAPI(rag, top_k=20, api_key=None)
+    api = OllamaAPI(FakeWorkspaceManager(rag), top_k=20, api_key=None)
     app = FastAPI()
     app.include_router(api.router, prefix="/api")
     return TestClient(app), rag

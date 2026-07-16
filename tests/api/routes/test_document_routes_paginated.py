@@ -18,6 +18,10 @@ DocProcessingStatus = _base.DocProcessingStatus
 DocStatus = _base.DocStatus
 DocStatusStorage = _base.DocStatusStorage
 
+from tests.api.routes._fake_workspace_manager import (  # noqa: E402
+    FakeWorkspaceManager,
+)
+
 pytestmark = pytest.mark.offline
 
 
@@ -69,7 +73,7 @@ _fake_doc_status = _FakeDocStatusStorage()
 _app = FastAPI()
 _app.include_router(
     create_document_routes(
-        SimpleNamespace(doc_status=_fake_doc_status),
+        FakeWorkspaceManager(SimpleNamespace(doc_status=_fake_doc_status)),
         SimpleNamespace(),
         api_key="test-key",
     )
@@ -146,7 +150,9 @@ def _strip_client() -> TestClient:
     app = FastAPI()
     app.include_router(
         create_document_routes(
-            SimpleNamespace(doc_status=_MetadataDocStatusStorage()),
+            FakeWorkspaceManager(
+                SimpleNamespace(doc_status=_MetadataDocStatusStorage())
+            ),
             SimpleNamespace(),
             api_key="test-key",
         )

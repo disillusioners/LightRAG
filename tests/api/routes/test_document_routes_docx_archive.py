@@ -34,6 +34,19 @@ resolve_stored_document_parser_engine = (
 get_parser = _parser_registry.get_parser
 ParseContext = _parser_base.ParseContext
 
+from tests.api.routes._fake_workspace_manager import (  # noqa: E402
+    FakeWorkspaceManager,
+)
+
+
+# Direct endpoint calls (upload_to_input_dir, scan_for_new_documents,
+# clear_documents, delete_document) now take ``http_request: Request`` as
+# their first positional arg per the workspace-isolation-v2 refactor.
+# ``get_workspace_from_request`` only reads ``request.headers.get``; an
+# empty headers dict yields workspace=None (the default).  Reused across
+# all in-test endpoint invocations.
+_REQUEST_NO_WORKSPACE = SimpleNamespace(headers={})
+
 
 async def _parse_via_registry(rag, engine, doc_id, file_path, content_data):
     """Drive a parser the way the pipeline worker does (registry dispatch)."""
@@ -953,7 +966,7 @@ async def test_upload_rejects_same_name_failed_doc_status_without_full_docs(
             }
         }
     )
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     upload_endpoint = [
         route.endpoint
         for route in router.routes
@@ -968,7 +981,9 @@ async def test_upload_rejects_same_name_failed_doc_status_without_full_docs(
     # rather than returning a "duplicated" 200 response.  Clients must delete
     # the existing record before re-uploading.
     with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(_document_routes.BackgroundTasks(), upload_file)
+        await upload_endpoint(
+            _REQUEST_NO_WORKSPACE, _document_routes.BackgroundTasks(), upload_file
+        )
     assert excinfo.value.status_code == 409
     assert "failed.docx" in excinfo.value.detail
     assert "Status: failed" in excinfo.value.detail
@@ -982,7 +997,7 @@ async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monke
     (tmp_path / "existing.docx").write_bytes(b"existing docx bytes")
     doc_manager = DocumentManager(str(tmp_path))
     rag = _DuplicateUploadRag({})
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     upload_endpoint = [
         route.endpoint
         for route in router.routes
@@ -996,7 +1011,9 @@ async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monke
     # Strict name pre-check: an INPUT directory file with the same canonical
     # basename now blocks the upload with 409.
     with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(_document_routes.BackgroundTasks(), upload_file)
+        await upload_endpoint(
+            _REQUEST_NO_WORKSPACE, _document_routes.BackgroundTasks(), upload_file
+        )
     assert excinfo.value.status_code == 409
     assert "existing.docx" in excinfo.value.detail
     assert not (tmp_path / "existing.[native].docx").exists()
@@ -1011,7 +1028,7 @@ async def test_upload_rejects_malformed_hint_with_detail(tmp_path, monkeypatch):
     )
     doc_manager = DocumentManager(str(tmp_path))
     rag = _DuplicateUploadRag({})
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     upload_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1024,7 +1041,9 @@ async def test_upload_rejects_malformed_hint_with_detail(tmp_path, monkeypatch):
     )
 
     with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(_document_routes.BackgroundTasks(), upload_file)
+        await upload_endpoint(
+            _REQUEST_NO_WORKSPACE, _document_routes.BackgroundTasks(), upload_file
+        )
     assert excinfo.value.status_code == 400
     assert "multiple chunking modes" in excinfo.value.detail
 
@@ -1053,7 +1072,7 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
     pipeline_status["pending_enqueues"] = 0
     pipeline_status["busy"] = True
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     upload_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1065,7 +1084,7 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
     )
 
     bg = _document_routes.BackgroundTasks()
-    response = await upload_endpoint(bg, upload_file)
+    response = await upload_endpoint(_REQUEST_NO_WORKSPACE, bg, upload_file)
 
     # Endpoint accepted the upload despite busy=True.
     assert response.status == "success"
@@ -1099,7 +1118,7 @@ async def test_upload_returns_409_when_scanning_classification(tmp_path, monkeyp
     pipeline_status["scanning"] = True
     pipeline_status["scanning_exclusive"] = True
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     upload_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1111,7 +1130,9 @@ async def test_upload_returns_409_when_scanning_classification(tmp_path, monkeyp
     )
 
     with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(_document_routes.BackgroundTasks(), upload_file)
+        await upload_endpoint(
+            _REQUEST_NO_WORKSPACE, _document_routes.BackgroundTasks(), upload_file
+        )
     assert excinfo.value.status_code == 409
     assert "classifying" in excinfo.value.detail.lower()
     assert not (tmp_path / "while_scanning.docx").exists()
@@ -1143,7 +1164,7 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
     pipeline_status["busy"] = True
     pipeline_status["pending_enqueues"] = 0
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     upload_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1155,7 +1176,7 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
     )
 
     bg = _document_routes.BackgroundTasks()
-    response = await upload_endpoint(bg, upload_file)
+    response = await upload_endpoint(_REQUEST_NO_WORKSPACE, bg, upload_file)
 
     # Endpoint accepted the upload despite scan in progress.
     assert response.status == "success"
@@ -1179,7 +1200,7 @@ async def test_scan_endpoint_returns_skipped_when_pipeline_busy(tmp_path):
     )
     pipeline_status["busy"] = True
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     scan_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1187,7 +1208,7 @@ async def test_scan_endpoint_returns_skipped_when_pipeline_busy(tmp_path):
     ][-1]
 
     bg = _document_routes.BackgroundTasks()
-    response = await scan_endpoint(bg)
+    response = await scan_endpoint(_REQUEST_NO_WORKSPACE, bg)
 
     assert response.status == "scanning_skipped_pipeline_busy"
     # No background task should have been scheduled.
@@ -1211,7 +1232,7 @@ async def test_scan_endpoint_returns_skipped_when_already_scanning(tmp_path):
     )
     pipeline_status["scanning"] = True
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     scan_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1219,7 +1240,7 @@ async def test_scan_endpoint_returns_skipped_when_already_scanning(tmp_path):
     ][-1]
 
     bg = _document_routes.BackgroundTasks()
-    response = await scan_endpoint(bg)
+    response = await scan_endpoint(_REQUEST_NO_WORKSPACE, bg)
 
     assert response.status == "scanning_skipped_pipeline_busy"
     assert len(bg.tasks) == 0
@@ -1243,7 +1264,7 @@ async def test_scan_endpoint_acquires_and_releases_scanning_flag(tmp_path, monke
     pipeline_status["busy"] = False
     pipeline_status["scanning"] = False
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     scan_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1251,7 +1272,7 @@ async def test_scan_endpoint_acquires_and_releases_scanning_flag(tmp_path, monke
     ][-1]
 
     bg = _document_routes.BackgroundTasks()
-    response = await scan_endpoint(bg)
+    response = await scan_endpoint(_REQUEST_NO_WORKSPACE, bg)
 
     # Endpoint scheduled the task and acquired the flag synchronously.
     assert response.status == "scanning_started"
@@ -1290,7 +1311,7 @@ async def test_scan_endpoint_returns_skipped_when_enqueue_pending(tmp_path):
     # Simulate a reservation made by /upload that has not yet released.
     pipeline_status["pending_enqueues"] = 1
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     scan_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1298,7 +1319,7 @@ async def test_scan_endpoint_returns_skipped_when_enqueue_pending(tmp_path):
     ][-1]
 
     bg = _document_routes.BackgroundTasks()
-    response = await scan_endpoint(bg)
+    response = await scan_endpoint(_REQUEST_NO_WORKSPACE, bg)
 
     assert response.status == "scanning_skipped_pipeline_busy"
     # No background task scheduled; scanning flag untouched.
@@ -1334,7 +1355,7 @@ async def test_reserve_enqueue_slot_blocks_concurrent_scan_until_release(tmp_pat
     assert reserved is True
     assert pipeline_status["pending_enqueues"] == 1
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     scan_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1342,7 +1363,7 @@ async def test_reserve_enqueue_slot_blocks_concurrent_scan_until_release(tmp_pat
     ][-1]
 
     bg = _document_routes.BackgroundTasks()
-    blocked = await scan_endpoint(bg)
+    blocked = await scan_endpoint(_REQUEST_NO_WORKSPACE, bg)
     assert blocked.status == "scanning_skipped_pipeline_busy"
 
     # Release: bg task wrapper would do this in finally.
@@ -1350,7 +1371,7 @@ async def test_reserve_enqueue_slot_blocks_concurrent_scan_until_release(tmp_pat
     assert pipeline_status["pending_enqueues"] == 0
 
     bg2 = _document_routes.BackgroundTasks()
-    allowed = await scan_endpoint(bg2)
+    allowed = await scan_endpoint(_REQUEST_NO_WORKSPACE, bg2)
     assert allowed.status == "scanning_started"
     assert pipeline_status["scanning"] is True
 
@@ -1422,7 +1443,7 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
     pipeline_status["pending_enqueues"] = 0
     pipeline_status["busy"] = True
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     upload_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1431,13 +1452,13 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
 
     bg_a = _document_routes.BackgroundTasks()
     upload_a = _document_routes.UploadFile(filename="a.docx", file=BytesIO(b"a bytes"))
-    response_a = await upload_endpoint(bg_a, upload_a)
+    response_a = await upload_endpoint(_REQUEST_NO_WORKSPACE, bg_a, upload_a)
     assert response_a.status == "success"
     assert pipeline_status["pending_enqueues"] == 1
 
     bg_b = _document_routes.BackgroundTasks()
     upload_b = _document_routes.UploadFile(filename="b.docx", file=BytesIO(b"b bytes"))
-    response_b = await upload_endpoint(bg_b, upload_b)
+    response_b = await upload_endpoint(_REQUEST_NO_WORKSPACE, bg_b, upload_b)
     assert response_b.status == "success"
     # Both reservations coexist while bg tasks are pending.
     assert pipeline_status["pending_enqueues"] == 2
@@ -1588,14 +1609,14 @@ async def test_clear_documents_sets_and_clears_destructive_busy(tmp_path):
         "pipeline_status", workspace=rag.workspace
     )
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     clear_endpoint = [
         route.endpoint
         for route in router.routes
         if getattr(route, "name", "") == "clear_documents"
     ][-1]
 
-    response = await clear_endpoint()
+    response = await clear_endpoint(_REQUEST_NO_WORKSPACE)
     assert response.status == "success"
     # destructive_busy was True for the duration of the storage drop.
     assert observed["destructive_busy"] is True
@@ -1628,7 +1649,7 @@ async def test_clear_documents_refuses_when_scanning_or_pending_enqueues(tmp_pat
         "pipeline_status", workspace=rag.workspace
     )
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     clear_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1639,7 +1660,7 @@ async def test_clear_documents_refuses_when_scanning_or_pending_enqueues(tmp_pat
     pipeline_status["busy"] = False
     pipeline_status["scanning"] = True
     pipeline_status["pending_enqueues"] = 0
-    response = await clear_endpoint()
+    response = await clear_endpoint(_REQUEST_NO_WORKSPACE)
     assert response.status == "busy"
     # Critical: no flag mutation occurred; scanning is still owned.
     assert pipeline_status["scanning"] is True
@@ -1648,7 +1669,7 @@ async def test_clear_documents_refuses_when_scanning_or_pending_enqueues(tmp_pat
     # Case 2: pending_enqueues>0 must refuse.
     pipeline_status["scanning"] = False
     pipeline_status["pending_enqueues"] = 1
-    response = await clear_endpoint()
+    response = await clear_endpoint(_REQUEST_NO_WORKSPACE)
     assert response.status == "busy"
     assert pipeline_status["pending_enqueues"] == 1
     assert pipeline_status.get("destructive_busy", False) is False
@@ -1657,7 +1678,7 @@ async def test_clear_documents_refuses_when_scanning_or_pending_enqueues(tmp_pat
     # job) must refuse — preserves existing behaviour.
     pipeline_status["pending_enqueues"] = 0
     pipeline_status["busy"] = True
-    response = await clear_endpoint()
+    response = await clear_endpoint(_REQUEST_NO_WORKSPACE)
     assert response.status == "busy"
     assert pipeline_status.get("destructive_busy", False) is False
 
@@ -1685,7 +1706,7 @@ async def test_delete_document_reserves_destructive_busy_synchronously(tmp_path)
         "pipeline_status", workspace=rag.workspace
     )
 
-    router = create_document_routes(rag, doc_manager)
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
     delete_endpoint = [
         route.endpoint
         for route in router.routes
@@ -1701,6 +1722,7 @@ async def test_delete_document_reserves_destructive_busy_synchronously(tmp_path)
     pipeline_status["pending_enqueues"] = 0
     bg = _document_routes.BackgroundTasks()
     response = await delete_endpoint(
+        _REQUEST_NO_WORKSPACE,
         DeleteDocRequest(doc_ids=["doc-1"]),
         bg,
     )
@@ -1717,6 +1739,7 @@ async def test_delete_document_reserves_destructive_busy_synchronously(tmp_path)
     pipeline_status["scanning"] = True
     bg = _document_routes.BackgroundTasks()
     response = await delete_endpoint(
+        _REQUEST_NO_WORKSPACE,
         DeleteDocRequest(doc_ids=["doc-1"]),
         bg,
     )
@@ -1729,6 +1752,7 @@ async def test_delete_document_reserves_destructive_busy_synchronously(tmp_path)
     pipeline_status["pending_enqueues"] = 1
     bg = _document_routes.BackgroundTasks()
     response = await delete_endpoint(
+        _REQUEST_NO_WORKSPACE,
         DeleteDocRequest(doc_ids=["doc-1"]),
         bg,
     )
@@ -2147,8 +2171,8 @@ async def test_clear_documents_honors_drop_error_status(tmp_path):
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
 
-    router = create_document_routes(rag, doc_manager)
-    response = await _clear_endpoint(router)()
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
+    response = await _clear_endpoint(router)(_REQUEST_NO_WORKSPACE)
 
     assert response.status == "partial_success"
 
@@ -2164,7 +2188,7 @@ async def test_clear_documents_succeeds_when_all_drops_succeed(tmp_path):
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
 
-    router = create_document_routes(rag, doc_manager)
-    response = await _clear_endpoint(router)()
+    router = create_document_routes(FakeWorkspaceManager(rag), doc_manager)
+    response = await _clear_endpoint(router)(_REQUEST_NO_WORKSPACE)
 
     assert response.status == "success"
