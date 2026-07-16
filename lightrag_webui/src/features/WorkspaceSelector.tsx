@@ -32,6 +32,18 @@ export function WorkspaceSelector() {
         const response = await getWorkspaces()
         if (!cancelled) {
           setWorkspaces(response.workspaces)
+          // Reconcile: if the persisted workspace is no longer present on the
+          // server, reset to default. Otherwise the axios interceptor would keep
+          // injecting the stale header and re-materialize a deleted workspace.
+          // Read/write imperatively to avoid stale closure capture from the
+          // `[]`-dep useEffect above.
+          const currentWs = useSettingsStore.getState().currentWorkspace
+          if (
+            currentWs !== '' &&
+            !response.workspaces.some((ws) => ws.name === currentWs)
+          ) {
+            useSettingsStore.getState().setCurrentWorkspace('')
+          }
         }
       } catch (error) {
         // Keep last known list on transient errors — better stale than blank.
