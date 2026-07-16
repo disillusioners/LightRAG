@@ -10,6 +10,7 @@ import { navigationService } from '@/services/navigation'
 import { ZapIcon, LogOutIcon } from 'lucide-react'
 import GithubIcon from '@/components/icons/GithubIcon'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
+import { WorkspaceSelector } from './WorkspaceSelector'
 
 interface NavigationTabProps {
   value: string
@@ -110,7 +111,7 @@ export default function SiteHeader() {
         )}
       </div>
 
-      <nav className="w-[200px] flex items-center justify-end">
+      <nav className="min-w-[260px] w-auto flex items-center justify-end">
         <div className="flex items-center gap-2">
           {versionDisplay && (
             <TooltipProvider>
@@ -126,6 +127,7 @@ export default function SiteHeader() {
               </Tooltip>
             </TooltipProvider>
           )}
+          <WorkspaceSelector />
           <Button variant="ghost" size="icon" side="bottom" tooltip={t('header.projectRepository')}>
             <a href={SiteInfo.github} target="_blank" rel="noopener noreferrer">
               <GithubIcon className="size-4" />

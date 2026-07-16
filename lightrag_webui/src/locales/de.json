@@ -489,5 +489,10 @@
     "prevPage": "Vorherige Seite",
     "nextPage": "Nächste Seite",
     "lastPage": "Letzte Seite"
+  },
+  "workspace": {
+    "title": "Arbeitsbereiche",
+    "default": "Standard",
+    "select": "Arbeitsbereich auswählen"
   }
 }

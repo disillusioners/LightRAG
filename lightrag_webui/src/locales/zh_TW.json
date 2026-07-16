@@ -489,5 +489,10 @@
     "prevPage": "上一頁",
     "nextPage": "下一頁",
     "lastPage": "最後一頁"
+  },
+  "workspace": {
+    "title": "工作區",
+    "default": "預設",
+    "select": "選擇工作區"
   }
 }

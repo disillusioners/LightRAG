@@ -489,5 +489,10 @@
     "prevPage": "Trang Trước",
     "nextPage": "Trang Tiếp",
     "lastPage": "Trang Cuối"
+  },
+  "workspace": {
+    "title": "Không gian làm việc",
+    "default": "Mặc định",
+    "select": "Chọn không gian làm việc"
   }
 }

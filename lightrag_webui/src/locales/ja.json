@@ -489,5 +489,10 @@
     "prevPage": "前のページ",
     "nextPage": "次のページ",
     "lastPage": "最後のページ"
+  },
+  "workspace": {
+    "title": "ワークスペース",
+    "default": "デフォルト",
+    "select": "ワークスペースを選択"
   }
 }

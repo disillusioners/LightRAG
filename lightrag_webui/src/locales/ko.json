@@ -489,5 +489,10 @@
     "prevPage": "이전 페이지",
     "nextPage": "다음 페이지",
     "lastPage": "마지막 페이지"
+  },
+  "workspace": {
+    "title": "워크스페이스",
+    "default": "기본값",
+    "select": "워크스페이스 선택"
   }
 }

@@ -5,6 +5,16 @@ import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
 import { navigationService } from '@/services/navigation'
 
+/**
+ * Sanitize workspace name for the LIGHTRAG-WORKSPACE header.
+ * Must match backend regex: re.sub(r"[^a-zA-Z0-9_-]", "_", workspace)
+ * Aligned with validate_workspace() — accepts hyphens, both cases.
+ */
+function sanitizeWorkspaceHeader(workspace: string): string {
+  const sanitized = workspace.replace(/[^a-zA-Z0-9_-]/g, '_')
+  return sanitized.substring(0, 64)
+}
+
 // Types
 export type LightragNodeType = {
   id: string
@@ -433,6 +443,12 @@ axiosInstance.interceptors.request.use((config) => {
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
   }
+
+  // Inject workspace header for workspace isolation
+  const currentWorkspace = useSettingsStore.getState().currentWorkspace
+  if (currentWorkspace) {
+    config.headers['LIGHTRAG-WORKSPACE'] = sanitizeWorkspaceHeader(currentWorkspace)
+  }
   return config
 })
 
@@ -569,6 +585,22 @@ export const checkHealth = async (): Promise<
   }
 }
 
+export interface WorkspaceInfo {
+  name: string
+  first_seen: string
+  last_seen: string
+  document_count: number | null
+}
+
+export interface WorkspacesResponse {
+  workspaces: WorkspaceInfo[]
+}
+
+export const getWorkspaces = async (): Promise<WorkspacesResponse> => {
+  const response = await axiosInstance.get('/workspaces')
+  return response.data
+}
+
 export const getDocuments = async (): Promise<DocsStatusesResponse> => {
   const response = await axiosInstance.get('/documents')
   return response.data
@@ -700,6 +732,11 @@ function _buildStreamHeaders(): HeadersInit {
   }
   if (apiKey) {
     headers['X-API-Key'] = apiKey;
+  }
+  // Inject workspace header for workspace isolation
+  const currentWorkspace = useSettingsStore.getState().currentWorkspace;
+  if (currentWorkspace) {
+    headers['LIGHTRAG-WORKSPACE'] = sanitizeWorkspaceHeader(currentWorkspace);
   }
   return headers;
 }
