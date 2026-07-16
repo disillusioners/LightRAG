@@ -11,7 +11,6 @@ from fastapi.openapi.docs import (
 )
 import json
 import os
-import re
 import logging
 import logging.config
 import sys
@@ -29,6 +28,7 @@ from dotenv import load_dotenv
 from lightrag.api.utils_api import (
     get_combined_auth_dependency,
     get_auth_status_dependency,
+    get_workspace_from_request,
     display_splash_screen,
     check_env_file,
 )
@@ -40,7 +40,7 @@ from .config import (
     PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS,
 )
 from lightrag.utils import get_env_value
-from lightrag import LightRAG, ROLES, RoleLLMConfig, __version__ as core_version
+from lightrag import ROLES, RoleLLMConfig, __version__ as core_version
 from lightrag.api import __api_version__
 from lightrag.utils import EmbeddingFunc
 from lightrag.constants import (
@@ -62,6 +62,15 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.workspace_routes import create_workspace_routes
+from lightrag.api.workspace_manager import (
+    WorkspaceManager,
+)
+from lightrag.api.llm_factory import (
+    resolve_role_llm_settings,
+    create_role_llm_func,
+    create_role_llm_model_kwargs,
+)
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -1200,6 +1209,25 @@ def check_frontend_build():
 
 
 def create_app(args):
+    # Warn about multi-worker behavior with workspace isolation (C6 in the
+    # workspace-isolation-v2 plan). WorkspaceManager's LRU cache and the
+    # WorkspaceRegistry are process-local: each worker maintains its own
+    # cache, so multi-worker mode multiplies memory usage by N and risks
+    # registry divergence (two workers can race on the same workspace).
+    # config.update_uvicorn_mode_config() clamps workers=1 in uvicorn mode
+    # BEFORE create_app runs, so this check effectively fires only when
+    # running under gunicorn (where workers > 1 is preserved).
+    workers = getattr(args, "workers", 1)
+    if workers and workers > 1:
+        logger.warning(
+            "⚠️  Multi-worker mode (workers=%d) detected. Workspace isolation "
+            "uses a per-process LRU cache that is NOT shared across workers. "
+            "Each worker maintains its own cache, leading to increased memory "
+            "usage and potential registry divergence. For workspace isolation, "
+            "use --workers 1 or configure session affinity at your reverse proxy.",
+            workers,
+        )
+
     # Check frontend build first and get status
     webui_assets_exist, is_frontend_outdated = check_frontend_build()
 
@@ -1278,24 +1306,31 @@ def create_app(args):
         app.state.background_tasks = set()
 
         try:
-            # Initialize database connections
-            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
-            await rag.initialize_storages()
+            # WorkspaceManager.initialize() eagerly constructs the
+            # default-workspace LightRAG instance (initialize_storages +
+            # check_and_migrate_data + register_role_llm_builder happen
+            # inside WorkspaceManager._create_rag_instance). Per-request
+            # workspaces are built lazily on the first acquire() for that
+            # workspace name. Do NOT also call initialize_storages /
+            # check_and_migrate_data here — the manager owns that lifecycle.
+            await workspace_mgr.initialize()
 
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
+            # Log role-LLM provider options on the default instance. Previously
+            # logged once at startup against the single global `rag`; now it
+            # runs after the default instance is materialized so the role
+            # config is observable through get_llm_role_config().
+            _log_role_provider_options(await workspace_mgr.get_default_instance())
 
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
 
         finally:
-            # Clean up database connections
-            await rag.finalize_storages()
+            await workspace_mgr.finalize()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
-                logger.debug("Unvicorn Mode: finalizing shared storage...")
+                logger.debug("Uvicorn Mode: finalizing shared storage...")
                 finalize_share_data()
             else:
                 # In Gunicorn mode with preload_app=True, cleanup is handled by on_exit hooks
@@ -1422,36 +1457,6 @@ def create_app(args):
     # Non-enforcing dependency: reports whether the caller is authenticated so
     # /health can stay a public liveness probe while gating sensitive config.
     auth_status = get_auth_status_dependency(api_key)
-
-    def get_workspace_from_request(request: Request) -> str | None:
-        """
-        Extract workspace from HTTP request header or use default.
-
-        This enables multi-workspace API support by checking the custom
-        'LIGHTRAG-WORKSPACE' header. If not present, falls back to the
-        server's default workspace configuration.
-
-        Args:
-            request: FastAPI Request object
-
-        Returns:
-            Workspace identifier (may be empty string for global namespace)
-        """
-        # Check custom header first
-        workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
-
-        if not workspace:
-            workspace = None
-        else:
-            sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", workspace)
-            if sanitized != workspace:
-                logger.warning(
-                    f"Workspace header '{workspace}' contains invalid characters. "
-                    f"Sanitized to '{sanitized}'."
-                )
-                workspace = sanitized
-
-        return workspace
 
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
@@ -1612,303 +1617,6 @@ def create_app(args):
                 raise Exception(f"Failed to import {binding} options: {e}")
         return {}
 
-    def resolve_role_llm_settings(
-        role: str, override_meta: dict | None = None
-    ) -> dict[str, Any]:
-        attr = role.lower()
-        override_meta = override_meta or {}
-
-        role_binding = (
-            override_meta.get("binding")
-            or getattr(args, f"{attr}_llm_binding", None)
-            or args.llm_binding
-        )
-        role_model = (
-            override_meta.get("model")
-            or getattr(args, f"{attr}_llm_model", None)
-            or args.llm_model
-        )
-        role_host = (
-            override_meta.get("host")
-            or getattr(args, f"{attr}_llm_binding_host", None)
-            or args.llm_binding_host
-        )
-        explicit_role_apikey = override_meta.get("api_key") or getattr(
-            args, f"{attr}_llm_binding_api_key", None
-        )
-        if role_binding == "bedrock":
-            if explicit_role_apikey:
-                raise ValueError(
-                    f"Bedrock role '{role}' does not support role-specific "
-                    "LLM_BINDING_API_KEY; use role-specific SigV4 AWS_* "
-                    "variables or process-level AWS_BEARER_TOKEN_BEDROCK."
-                )
-            role_apikey = None
-        else:
-            role_apikey = explicit_role_apikey or args.llm_binding_api_key
-        role_timeout = (
-            override_meta.get("timeout")
-            or getattr(args, f"{attr}_llm_timeout", None)
-            or llm_timeout
-        )
-        role_max_async = override_meta.get("max_async")
-        if role_max_async is None:
-            role_max_async = getattr(args, f"{attr}_llm_max_async", None)
-        is_cross_provider = role_binding != args.llm_binding
-
-        role_provider_options = override_meta.get("provider_options")
-        if role_provider_options is None:
-            if role_binding in ["openai", "azure_openai"]:
-                from lightrag.llm.binding_options import OpenAILLMOptions
-
-                role_provider_options = OpenAILLMOptions.options_dict_for_role(
-                    args, role, is_cross_provider
-                )
-            elif role_binding == "gemini":
-                from lightrag.llm.binding_options import GeminiLLMOptions
-
-                role_provider_options = GeminiLLMOptions.options_dict_for_role(
-                    args, role, is_cross_provider
-                )
-            elif role_binding in ["lollms", "ollama"]:
-                from lightrag.llm.binding_options import OllamaLLMOptions
-
-                role_provider_options = OllamaLLMOptions.options_dict_for_role(
-                    args, role, is_cross_provider
-                )
-            elif role_binding == "bedrock":
-                from lightrag.llm.binding_options import BedrockLLMOptions
-
-                role_provider_options = BedrockLLMOptions.options_dict_for_role(
-                    args, role, is_cross_provider
-                )
-            else:
-                role_provider_options = {}
-
-        bedrock_aws_options = {}
-        if role_binding == "bedrock":
-            override_bedrock_aws_options = override_meta.get("bedrock_aws_options", {})
-            bedrock_aws_options = {
-                "aws_region": override_meta.get("aws_region")
-                or override_bedrock_aws_options.get("aws_region")
-                or getattr(args, f"{attr}_aws_region", None)
-                or getattr(args, "aws_region", None),
-                "aws_access_key_id": override_meta.get("aws_access_key_id")
-                or override_bedrock_aws_options.get("aws_access_key_id")
-                or getattr(args, f"{attr}_aws_access_key_id", None)
-                or getattr(args, "aws_access_key_id", None),
-                "aws_secret_access_key": override_meta.get("aws_secret_access_key")
-                or override_bedrock_aws_options.get("aws_secret_access_key")
-                or getattr(args, f"{attr}_aws_secret_access_key", None)
-                or getattr(args, "aws_secret_access_key", None),
-                "aws_session_token": override_meta.get("aws_session_token")
-                or override_bedrock_aws_options.get("aws_session_token")
-                or getattr(args, f"{attr}_aws_session_token", None)
-                or getattr(args, "aws_session_token", None),
-            }
-
-        return {
-            "binding": role_binding,
-            "model": role_model,
-            "host": role_host,
-            "api_key": role_apikey,
-            "timeout": role_timeout,
-            "max_async": role_max_async,
-            "provider_options": role_provider_options,
-            "is_cross_provider": is_cross_provider,
-            "bedrock_aws_options": bedrock_aws_options,
-        }
-
-    def create_role_llm_func(role: str, override_meta: dict | None = None):
-        """Create an independent raw LLM function for a role."""
-        settings = resolve_role_llm_settings(role, override_meta)
-        role_binding = settings["binding"]
-        role_model = settings["model"]
-        role_host = settings["host"]
-        role_apikey = settings["api_key"]
-        role_timeout = settings["timeout"]
-        role_provider_options = settings["provider_options"]
-        bedrock_aws_options = settings["bedrock_aws_options"]
-
-        try:
-            if role_binding == "ollama":
-                from lightrag.llm.ollama import _ollama_model_if_cache
-
-                async def role_ollama_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    enable_cot: bool = False,
-                    **kwargs,
-                ):
-                    # response_format and legacy extraction booleans flow
-                    # through kwargs to _ollama_model_if_cache, which handles
-                    # the deprecation shim and emits a single warning.
-                    if history_messages is None:
-                        history_messages = []
-                    if role_provider_options:
-                        kwargs.setdefault("options", dict(role_provider_options))
-                    return await _ollama_model_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        enable_cot=enable_cot,
-                        host=role_host,
-                        timeout=role_timeout,
-                        api_key=role_apikey,
-                        **kwargs,
-                    )
-
-                return role_ollama_complete
-            if role_binding == "lollms":
-                from lightrag.llm.lollms import lollms_model_if_cache
-
-                async def role_lollms_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    enable_cot: bool = False,
-                    **kwargs,
-                ):
-                    # response_format and legacy extraction booleans flow
-                    # through kwargs to lollms_model_if_cache, which drops
-                    # them and emits deprecation warnings when booleans are set.
-                    if history_messages is None:
-                        history_messages = []
-                    if role_provider_options:
-                        kwargs = {**role_provider_options, **kwargs}
-                    return await lollms_model_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        enable_cot=enable_cot,
-                        base_url=role_host,
-                        api_key=role_apikey,
-                        timeout=role_timeout,
-                        **kwargs,
-                    )
-
-                return role_lollms_complete
-            if role_binding == "bedrock":
-                from lightrag.llm.bedrock import bedrock_complete_if_cache
-
-                async def role_bedrock_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    if role_provider_options:
-                        kwargs = {**role_provider_options, **kwargs}
-                    return await bedrock_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        endpoint_url=role_host,
-                        **bedrock_aws_options,
-                        **kwargs,
-                    )
-
-                return role_bedrock_complete
-            if role_binding == "azure_openai":
-                from lightrag.llm.azure_openai import azure_openai_complete_if_cache
-
-                async def role_azure_openai_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    kwargs["timeout"] = role_timeout
-                    if role_provider_options:
-                        kwargs.update(role_provider_options)
-                    return await azure_openai_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        base_url=role_host,
-                        api_key=role_apikey or os.getenv("AZURE_OPENAI_API_KEY"),
-                        api_version=os.getenv(
-                            "AZURE_OPENAI_API_VERSION", "2024-08-01-preview"
-                        ),
-                        **kwargs,
-                    )
-
-                return role_azure_openai_complete
-            if role_binding == "gemini":
-                from lightrag.llm.gemini import gemini_complete_if_cache
-
-                async def role_gemini_complete(
-                    prompt,
-                    system_prompt=None,
-                    history_messages=None,
-                    **kwargs,
-                ) -> str:
-                    if history_messages is None:
-                        history_messages = []
-                    kwargs["timeout"] = role_timeout
-                    if role_provider_options and "generation_config" not in kwargs:
-                        kwargs["generation_config"] = dict(role_provider_options)
-                    return await gemini_complete_if_cache(
-                        role_model,
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        api_key=role_apikey,
-                        base_url=role_host,
-                        **kwargs,
-                    )
-
-                return role_gemini_complete
-
-            from lightrag.llm.openai import openai_complete_if_cache
-
-            async def role_openai_complete(
-                prompt,
-                system_prompt=None,
-                history_messages=None,
-                **kwargs,
-            ) -> str:
-                if history_messages is None:
-                    history_messages = []
-                kwargs["timeout"] = role_timeout
-                if role_provider_options:
-                    kwargs.update(role_provider_options)
-                return await openai_complete_if_cache(
-                    role_model,
-                    prompt,
-                    system_prompt=system_prompt,
-                    history_messages=history_messages,
-                    base_url=role_host,
-                    api_key=role_apikey,
-                    **kwargs,
-                )
-
-            return role_openai_complete
-        except ImportError as e:
-            raise Exception(f"Failed to create LLM for role '{role}': {e}")
-
-    def create_role_llm_model_kwargs(
-        role: str, override_meta: dict | None = None
-    ) -> dict[str, Any] | None:
-        """Create role-specific kwargs for runtime wrapper injection.
-
-        Role functions built above already encapsulate provider host/model/api_key/options,
-        so we intentionally return an empty dict here to prevent base kwargs inheritance
-        from polluting cross-provider role calls.
-        """
-        _ = role
-        _ = override_meta
-        return {}
-
     llm_timeout = args.llm_timeout
     embedding_timeout = args.embedding_timeout
 
@@ -2022,105 +1730,77 @@ def create_app(args):
         name=args.simulated_model_name, tag=args.simulated_model_tag
     )
 
-    # LightRAG.__post_init__ normalizes addon_params and backfills env-based defaults
-    # (SUMMARY_LANGUAGE, ENTITY_TYPE_PROMPT_FILE, ...), so we only need to pass the
-    # API-level overrides here.
-    addon_params = {
-        "language": args.summary_language,
-    }
-
     role_llm_configs = {
         spec.name: {
-            **resolve_role_llm_settings(spec.name),
-            "func": create_role_llm_func(spec.name),
+            **resolve_role_llm_settings(spec.name, args, llm_timeout),
+            "func": create_role_llm_func(spec.name, args, llm_timeout),
             "kwargs": create_role_llm_model_kwargs(spec.name),
         }
         for spec in ROLES
     }
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
-                args.llm_binding, args, llm_timeout
-            ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
-                "cosine_better_than_threshold": args.cosine_threshold
-            },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            vlm_process_enable=args.vlm_process_enable,
-            rerank_model_func=rerank_model_func,
-            rerank_model_max_async=args.rerank_max_async,
-            default_rerank_timeout=args.rerank_timeout,
-            max_parallel_insert=args.max_parallel_insert,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params=addon_params,
-            ollama_server_infos=ollama_server_infos,
-            role_llm_configs={
-                spec.name: RoleLLMConfig(
-                    func=role_llm_configs[spec.name]["func"],
-                    kwargs=role_llm_configs[spec.name]["kwargs"],
-                    max_async=role_llm_configs[spec.name]["max_async"],
-                    timeout=role_llm_configs[spec.name]["timeout"],
-                    metadata={
-                        "base_binding": args.llm_binding,
-                        "binding": role_llm_configs[spec.name]["binding"],
-                        "model": role_llm_configs[spec.name]["model"],
-                        "host": role_llm_configs[spec.name]["host"],
-                        "api_key": role_llm_configs[spec.name]["api_key"],
-                        "provider_options": role_llm_configs[spec.name][
-                            "provider_options"
-                        ],
-                        "bedrock_aws_options": role_llm_configs[spec.name][
-                            "bedrock_aws_options"
-                        ],
-                        "is_cross_provider": role_llm_configs[spec.name][
-                            "is_cross_provider"
-                        ],
-                    },
-                )
-                for spec in ROLES
-            },
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
-        raise
-
-    _log_role_provider_options(rag)
-
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
-        )
+    # Build the WorkspaceManager instead of a single global `rag` instance.
+    #
+    # WorkspaceManager owns a per-workspace LRU cache of LightRAG instances,
+    # guarded by asyncio locks and refcounted via acquire/release. The default
+    # workspace is created eagerly inside workspace_mgr.initialize() (which
+    # runs in the lifespan context below); per-request workspaces are built
+    # lazily on the first acquire() for that workspace name.
+    #
+    # LightRAG construction (initialize_storages + check_and_migrate_data +
+    # register_role_llm_builder) is performed inside
+    # WorkspaceManager._create_rag_instance() for every cache entry, so the
+    # call sites below intentionally omit those steps.
+    workspace_mgr = WorkspaceManager(
+        args=args,
+        embedding_func=embedding_func,
+        llm_model_func=create_llm_model_func(args.llm_binding),
+        llm_model_kwargs=create_llm_model_kwargs(args.llm_binding, args, llm_timeout),
+        llm_timeout=llm_timeout,
+        embedding_timeout=embedding_timeout,
+        rerank_model_func=rerank_model_func,
+        role_llm_configs={
+            spec.name: RoleLLMConfig(
+                func=role_llm_configs[spec.name]["func"],
+                kwargs=role_llm_configs[spec.name]["kwargs"],
+                max_async=role_llm_configs[spec.name]["max_async"],
+                timeout=role_llm_configs[spec.name]["timeout"],
+                metadata={
+                    "base_binding": args.llm_binding,
+                    "binding": role_llm_configs[spec.name]["binding"],
+                    "model": role_llm_configs[spec.name]["model"],
+                    "host": role_llm_configs[spec.name]["host"],
+                    "api_key": role_llm_configs[spec.name]["api_key"],
+                    "provider_options": role_llm_configs[spec.name]["provider_options"],
+                    "bedrock_aws_options": role_llm_configs[spec.name][
+                        "bedrock_aws_options"
+                    ],
+                    "is_cross_provider": role_llm_configs[spec.name][
+                        "is_cross_provider"
+                    ],
+                },
+            )
+            for spec in ROLES
+        },
+        ollama_server_infos=ollama_server_infos,
     )
 
-    # Add routes
+    # Add routes — pass workspace_mgr instead of rag. Each route handler is
+    # responsible for acquire(workspace) / release(workspace) so per-request
+    # workspace isolation is preserved end-to-end. The factories and OllamaAPI
+    # will be updated to consume workspace_mgr in a follow-up; for now the
+    # literal signature swap surfaces the wiring change here.
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
-    app.include_router(create_document_routes(rag, doc_manager, api_key))
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_document_routes(workspace_mgr, doc_manager, api_key))
+    app.include_router(create_query_routes(workspace_mgr, api_key, args.top_k))
+    app.include_router(create_graph_routes(workspace_mgr, api_key))
 
-    # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+    # Workspace management routes (list known workspaces, default name).
+    app.include_router(create_workspace_routes(workspace_mgr, api_key))
+
+    # Add Ollama API routes — pass workspace_mgr instead of rag.
+    ollama_api = OllamaAPI(workspace_mgr, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
 
     # Custom Swagger UI endpoint for offline support
@@ -2294,11 +1974,23 @@ def create_app(args):
         liveness signals; sensitive configuration is returned only when the
         caller is authenticated (see get_auth_status_dependency).
         """
+        # Resolve the LIGHTRAG-WORKSPACE header (if any) up front so the
+        # finally block always has a workspace to release the per-workspace
+        # LightRAG ref against. The 'workspace' payload field below still
+        # reports the configured default workspace for backwards compatibility
+        # with prior /health responses — only per-workspace diagnostics are
+        # routed through request-supplied workspace.
+        default_workspace = get_default_workspace()
+        requested_workspace = get_workspace_from_request(request)
+        workspace = (
+            requested_workspace
+            if requested_workspace is not None
+            else default_workspace
+        )
+        # rag is acquired lazily inside the authenticated branch (where it is
+        # actually needed); keep the None guard for the finally-block release.
+        rag = None
         try:
-            workspace = get_workspace_from_request(request)
-            default_workspace = get_default_workspace()
-            if workspace is None:
-                workspace = default_workspace
             pipeline_status = await get_namespace_data(
                 "pipeline_status", workspace=workspace
             )
@@ -2350,6 +2042,13 @@ def create_app(args):
 
             # Cleanup expired keyed locks and get status
             keyed_lock_info = cleanup_keyed_lock()
+
+            # Acquire the workspace-scoped LightRAG instance for the
+            # per-workspace diagnostics below (storage workspaces, role-LLM
+            # config, queue statuses). Release in the finally block — even
+            # if status_data.update() raises — so the LRU cache refcount
+            # stays balanced under exceptional control flow.
+            rag = await workspace_mgr.acquire(workspace)
 
             status_data.update(
                 {
@@ -2424,6 +2123,12 @@ def create_app(args):
         except Exception as e:
             logger.error(f"Error getting health status: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            # Release the per-workspace LightRAG ref acquired above. Safe to
+            # call when rag is None (unauthenticated fast path returns before
+            # the acquire).
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     # Pre-render the runtime-config <script> once. The browser-visible URL
     # prefixes are NOT baked into the bundle anymore — index.html ships with
