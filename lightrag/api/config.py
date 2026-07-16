@@ -59,6 +59,11 @@ DEFAULT_TOKEN_SECRET = "lightrag-jwt-default-secret-key!"
 NO_PREFIX_SENTINEL = "NO_PREFIX"
 PROVIDER_ASYMMETRIC_EMBEDDING_BINDINGS = {"gemini", "jina", "voyageai"}
 PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS = {"azure_openai", "ollama", "openai"}
+# Maximum length of a sanitized workspace name. Mirrors the WebUI client's
+# ``sanitizeWorkspaceHeader()`` truncation (``substring(0, 64)``) so that a
+# workspace created via env/CLI with >64 chars routes to the same name on
+# both clients. Keep in sync with ``MAX_WORKSPACE_LEN`` in utils_api.py.
+MAX_WORKSPACE_LEN = 64
 
 
 class DefaultRAGStorageConfig:
@@ -736,14 +741,23 @@ def parse_args() -> argparse.Namespace:
     ollama_server_infos.LIGHTRAG_NAME = args.simulated_model_name
     ollama_server_infos.LIGHTRAG_TAG = args.simulated_model_tag
 
-    # Sanitize workspace: only alphanumeric characters and underscores are allowed
+    # Sanitize workspace: only alphanumeric characters, underscores, and hyphens are allowed
     if args.workspace:
-        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", args.workspace)
+        sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", args.workspace)
+        # Truncate AFTER sanitization so that workspaces whose sanitized form
+        # exceeds 64 chars (the WebUI's truncation boundary) resolve to the
+        # same name whether they were created via env/CLI or via the WebUI.
+        if len(sanitized) > MAX_WORKSPACE_LEN:
+            logging.warning(
+                "Workspace name exceeds %d chars; truncating.",
+                MAX_WORKSPACE_LEN,
+            )
+            sanitized = sanitized[:MAX_WORKSPACE_LEN]
         if sanitized != args.workspace:
             logging.warning(
                 f"Workspace name '{args.workspace}' contains invalid characters. "
                 f"It has been sanitized to '{sanitized}'. "
-                "Only alphanumeric characters and underscores are allowed."
+                "Only alphanumeric characters, underscores, and hyphens are allowed."
             )
             args.workspace = sanitized
 

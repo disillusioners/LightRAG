@@ -686,3 +686,88 @@ class TestStreamingWorkspaceHeaderRouted:
             "Streaming endpoint must acquire the workspace derived from "
             "the LIGHTRAG-WORKSPACE header."
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests — workspace ref held across streaming body
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingWorkspaceHeldAcrossBody:
+    """The workspace ref must remain held WHILE the streaming body is in
+    flight, not be released as soon as the handler returns the
+    :class:`StreamingResponse`.
+
+    Python's ``try/finally`` semantics mean ``return StreamingResponse(...)``
+    triggers the outer ``finally`` BEFORE the streaming body is iterated
+    (Starlette iterates the body in a separate ``await response(...)`` that
+    runs after the handler has fully returned). If the handler's outer
+    ``finally`` releases the workspace, the streaming endpoint's ``rag``
+    ends up with refcount=0 during the body's iteration. A concurrent
+    ``acquire()`` that misses and finds the cache at capacity will then
+    tombstone + background-finalize the workspace, calling
+    ``await rag.finalize_storages()`` on the same ``rag`` instance the body
+    iterator is still using — which closes storage connections mid-stream.
+
+    The contract under test: while the body iterator is paused mid-stream
+    (between chunks), no release may have fired yet. The release fires
+    exactly once, AFTER the body completes (or is closed).
+    """
+
+    def test_streaming_workspace_held_until_body_completes(self) -> None:
+        hang_event = asyncio.Event()
+
+        async def _iter() -> AsyncIterator[str]:
+            yield "chunk-a"
+            # Park the streaming generator between chunks. With the bug,
+            # the workspace has already been released by the handler's
+            # outer ``finally``, so the test sees release_count == 1
+            # at this point. With the fix, release_count is still 0.
+            await hang_event.wait()
+            yield "chunk-b"
+
+        rag_mock = _RagIterator(_iter)
+        spy = SpyWorkspaceManager(rag_mock)
+        endpoint = _find_streaming_endpoint(spy)
+
+        async def _scenario() -> None:
+            streaming_resp = await _invoke_streaming_endpoint(
+                endpoint, rag_mock, "stream-hold"
+            )
+            body_iter = streaming_resp.body_iterator
+
+            # Drain past the references line and first response chunk,
+            # then park on hang_event.wait().
+            _ = await body_iter.__anext__()  # references line
+            first = await body_iter.__anext__()
+            assert "chunk-a" in (first if isinstance(first, str) else first.decode())
+
+            # CRITICAL: release must not have fired while the body is in
+            # flight. If it has, refcount is 0 during streaming and a
+            # concurrent acquire-miss can tombstone + finalize the rag
+            # out from under the body iterator.
+            assert spy.release_count == 0, (
+                f"Workspace released before streaming body completed! "
+                f"Got release_count={spy.release_count} while the body "
+                f"iterator is paused mid-stream. This allows concurrent "
+                f"acquire-miss to evict+finalize the workspace out from "
+                f"under the streaming response."
+            )
+
+            # Resume and finish the body.
+            hang_event.set()
+            await body_iter.aclose()
+
+        try:
+            asyncio.run(_scenario())
+        finally:
+            hang_event.set()
+
+        # End-of-stream checks — the per-request contract still holds:
+        # exactly one acquire, exactly one release, on the right workspace.
+        assert spy.acquire_count == 1
+        assert spy.release_count == 1, (
+            f"Expected exactly one release after the body completed; "
+            f"got {spy.release_count}."
+        )
+        assert spy.released_workspaces[0] == "stream-hold"

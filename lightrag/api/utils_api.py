@@ -4,6 +4,7 @@ Utility functions for the LightRAG API.
 
 import os
 import argparse
+import re
 from typing import Optional, List, Tuple
 import sys
 import time
@@ -39,6 +40,19 @@ _TOKEN_RENEWAL_SKIP_PATHS = [
     "/documents/paginated",
     "/documents/pipeline_status",
 ]
+
+# ========== Workspace Header Limits ==========
+# Maximum length of the LIGHTRAG-WORKSPACE header value BEFORE any
+# sanitization. Requests exceeding this are rejected with HTTP 400 to
+# prevent DoS via oversized headers (a 10MB header would otherwise tie
+# up CPU on the regex over a huge string).
+MAX_WORKSPACE_INPUT_LENGTH = 128
+# Maximum length of a workspace name AFTER sanitization. Mirrors the
+# WebUI client's ``sanitizeWorkspaceHeader()`` truncation
+# (``substring(0, 64)``) so that WebUI requests and non-WebUI clients
+# always route to the same workspace name, regardless of who created
+# the workspace first.
+MAX_WORKSPACE_LEN = 64
 
 
 def check_env_file():
@@ -372,6 +386,64 @@ def whitelist_exposes_api_routes(whitelist_paths: str) -> bool:
             if entry == "/api" or entry.startswith("/api/"):
                 return True
     return False
+
+
+def get_workspace_from_request(request: Request) -> str | None:
+    """Extract and sanitize the LIGHTRAG-WORKSPACE header from a request.
+
+    Reads the ``LIGHTRAG-WORKSPACE`` header from the incoming request, strips
+    surrounding whitespace, and sanitizes invalid characters by replacing them
+    with underscores. Hyphens are permitted alongside alphanumerics and
+    underscores. Returns ``None`` if the header is absent or empty.
+
+    DoS guard: a header value longer than ``MAX_WORKSPACE_INPUT_LENGTH``
+    characters is rejected with HTTP 400 before any further processing, to
+    prevent attackers from tying up CPU on the regex over a huge string.
+
+    Truncation: the sanitized workspace name is truncated to
+    ``MAX_WORKSPACE_LEN`` characters so that WebUI clients (which truncate
+    to 64 chars in ``sanitizeWorkspaceHeader``) and non-WebUI clients route
+    to the same workspace regardless of which one created it first.
+
+    Args:
+        request: The incoming FastAPI ``Request`` object.
+
+    Returns:
+        The sanitized workspace name, or ``None`` if no workspace header was
+        provided.
+
+    Raises:
+        HTTPException: 400 if the header value exceeds
+            ``MAX_WORKSPACE_INPUT_LENGTH`` characters.
+    """
+    workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
+    if not workspace:
+        return None
+    # DoS guard: reject oversized headers before any further work. A single
+    # 10MB header would otherwise force the regex over a huge string.
+    if len(workspace) > MAX_WORKSPACE_INPUT_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Workspace name too long (max {MAX_WORKSPACE_INPUT_LENGTH} characters)",
+        )
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", workspace)
+    # Truncate AFTER sanitization so that a workspace whose sanitized form
+    # exceeds 64 chars (the WebUI's truncation boundary) still resolves to
+    # the same name on both clients.
+    if len(sanitized) > MAX_WORKSPACE_LEN:
+        logger.warning(
+            "Workspace header exceeds %d chars; truncating.",
+            MAX_WORKSPACE_LEN,
+        )
+        sanitized = sanitized[:MAX_WORKSPACE_LEN]
+    if sanitized != workspace:
+        logger.warning(
+            "Workspace header '%s' contains invalid characters. Sanitized to '%s'.",
+            workspace,
+            sanitized,
+        )
+        return sanitized
+    return workspace
 
 
 def display_splash_screen(args: argparse.Namespace) -> None:

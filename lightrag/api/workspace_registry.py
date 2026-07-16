@@ -34,6 +34,12 @@ class WorkspaceRegistry:
         default_workspace: The canonical name of the default workspace.
             ``None`` / empty strings passed to other methods are normalized
             to this value.
+        max_workspaces: Hard cap on the number of distinct workspace names
+            the registry will track. Prevents unbounded growth from
+            malicious or buggy clients sending many distinct workspace
+            headers. Re-registration of an existing workspace is always
+            allowed (it only refreshes ``last_seen``); only NEW
+            registrations are gated by this cap.
         _workspaces: Ordered mapping ``workspace_name -> {"name": str,
             "first_seen": str, "last_seen": str}``. ``first_seen`` is the
             immutable ISO 8601 timestamp of the workspace's first
@@ -42,14 +48,20 @@ class WorkspaceRegistry:
         _lock: Async lock that serializes mutations.
     """
 
-    def __init__(self, default_workspace: str = "") -> None:
+    def __init__(self, default_workspace: str = "", max_workspaces: int = 256) -> None:
         """Initialize the registry and register the default workspace.
 
         Args:
             default_workspace: Canonical name for the default workspace.
                 Empty string is treated as the default.
+            max_workspaces: Maximum number of distinct workspaces the
+                registry will accept. Defaults to 256, which is far above
+                any realistic single-instance tenant count but well below
+                anything that could exhaust memory. Pass a smaller value
+                in tests.
         """
         self.default_workspace: str = default_workspace or ""
+        self.max_workspaces: int = max_workspaces
         self._workspaces: "OrderedDict[str, dict]" = OrderedDict()
         self._lock: asyncio.Lock = asyncio.Lock()
 
@@ -100,6 +112,19 @@ class WorkspaceRegistry:
                     name,
                     self._workspaces[name]["first_seen"],
                     now,
+                )
+                return
+            # Enforce registry capacity cap to prevent unbounded growth from
+            # malicious or buggy clients sending many distinct workspace
+            # headers. Re-registration of an existing workspace is always
+            # allowed (handled by the early return above); only NEW
+            # registrations are gated. We skip rather than raise so a single
+            # bad client can't break request flow for everyone else.
+            if len(self._workspaces) >= self.max_workspaces:
+                logger.warning(
+                    "Workspace registry at capacity (%d); skipping registration of %r",
+                    self.max_workspaces,
+                    name,
                 )
                 return
             self._workspaces[name] = {

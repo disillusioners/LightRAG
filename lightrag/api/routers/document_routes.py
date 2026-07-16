@@ -24,6 +24,7 @@ from fastapi import (
     Depends,
     File,
     HTTPException,
+    Request,
     UploadFile,
 )
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -54,7 +55,11 @@ from lightrag.utils import (
     generate_track_id,
     move_file_to_parsed_dir,
 )
-from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.utils_api import (
+    get_combined_auth_dependency,
+    get_workspace_from_request,
+)
+from lightrag.api.workspace_manager import WorkspaceCacheFullError
 from ..config import global_args
 
 
@@ -2448,7 +2453,7 @@ async def background_delete_documents(
 
 
 def create_document_routes(
-    rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None
+    workspace_mgr, doc_manager: DocumentManager, api_key: Optional[str] = None
 ):
     # Fresh router per call — see the note above the temp_prefix constant.
     router = APIRouter(
@@ -2462,7 +2467,9 @@ def create_document_routes(
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
-    async def scan_for_new_documents(background_tasks: BackgroundTasks):
+    async def scan_for_new_documents(
+        http_request: Request, background_tasks: BackgroundTasks
+    ):
         """
         Trigger the scanning process for new documents.
 
@@ -2492,101 +2499,135 @@ def create_document_routes(
         from lightrag.exceptions import PipelineNotInitializedError
         from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 
-        # Generate track_id with "scan" prefix for scanning operation
-        track_id = generate_track_id("scan")
+        workspace = get_workspace_from_request(http_request)
+        # Build a per-request DocumentManager so file-path operations (scan,
+        # upload, delete, clear) target this workspace's input directory.
+        ws_doc_manager = DocumentManager(
+            str(doc_manager.base_input_dir), workspace=workspace or ""
+        )
+        rag = None
+
+        # Background task that owns the scanning lifecycle.  Hoisted here so it
+        # is reachable from both the PipelineNotInitializedError short-circuit
+        # below and the normal flow after the scanning flags are acquired.
+        async def _run_scanning_with_workspace():
+            bg_rag = await workspace_mgr.acquire(workspace)
+            try:
+                await run_scanning_process(bg_rag, ws_doc_manager, track_id)
+            finally:
+                await workspace_mgr.release(workspace)
 
         try:
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
-            )
-        except PipelineNotInitializedError:
-            # Workspace pipeline_status not yet bootstrapped (e.g. mocked
-            # test rigs).  Treat as idle and allow the scan to proceed; the
-            # scanning flag has nowhere to live so it is effectively skipped.
-            background_tasks.add_task(run_scanning_process, rag, doc_manager, track_id)
-            return ScanResponse(
-                status="scanning_started",
-                message="Scanning process has been initiated in the background",
-                track_id=track_id,
-            )
-        pipeline_status_lock = get_namespace_lock(
-            "pipeline_status", workspace=rag.workspace
-        )
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                # Generate track_id with "scan" prefix for scanning operation
+                track_id = generate_track_id("scan")
 
-        # Atomically acquire the scanning flag.  Scan is the exclusive
-        # writer in this contract — it reads doc_status to make
-        # classification decisions (PROCESSED / resume / retry-as-new /
-        # archive) and would race with concurrent writers — so refuse if:
-        #   * pipeline is processing (busy=True): scan + processing both
-        #     read/mutate doc_status; serialise.
-        #   * another scan is in flight (scanning=True).
-        #   * any /upload, /text, /texts endpoint has reserved a
-        #     pending-enqueue slot (see _reserve_enqueue_slot): the bg
-        #     task has not yet written doc_status and we would otherwise
-        #     race with its mid-flight write.
-        async with pipeline_status_lock:
-            if pipeline_status.get("busy"):
-                logger.warning(
-                    "Scan request skipped: pipeline is busy processing documents"
-                )
-                return ScanResponse(
-                    status="scanning_skipped_pipeline_busy",
-                    message=(
-                        "Pipeline is currently busy processing documents. "
-                        "Wait for the running job to finish before triggering another scan."
-                    ),
-                    track_id=track_id,
-                )
-            if pipeline_status.get("scanning"):
-                logger.warning(
-                    "Scan request skipped: another scan is already in progress"
-                )
-                return ScanResponse(
-                    status="scanning_skipped_pipeline_busy",
-                    message=(
-                        "Another scan is already in progress. "
-                        "Wait for it to finish before triggering a new one."
-                    ),
-                    track_id=track_id,
-                )
-            pending_enqueues = pipeline_status.get("pending_enqueues", 0)
-            if pending_enqueues > 0:
-                logger.warning(
-                    "Scan request skipped: "
-                    f"{pending_enqueues} pending enqueue(s) reserved by "
-                    "upload/insert endpoints"
-                )
-                return ScanResponse(
-                    status="scanning_skipped_pipeline_busy",
-                    message=(
-                        "Document upload/insert is being enqueued. "
-                        "Wait for in-flight work to complete before triggering a scan."
-                    ),
-                    track_id=track_id,
-                )
-            # ``scanning`` covers the whole scan task lifecycle (used by
-            # this endpoint to refuse overlapping scans).
-            # ``scanning_exclusive`` is True only during the
-            # classification phase: run_scanning_process clears it once
-            # classification is done so concurrent uploads can land
-            # while the scan-driven processing finishes.
-            pipeline_status["scanning"] = True
-            pipeline_status["scanning_exclusive"] = True
+                try:
+                    pipeline_status = await get_namespace_data(
+                        "pipeline_status", workspace=rag.workspace
+                    )
+                except PipelineNotInitializedError:
+                    # Workspace pipeline_status not yet bootstrapped (e.g. mocked
+                    # test rigs).  Treat as idle and allow the scan to proceed; the
+                    # scanning flag has nowhere to live so it is effectively skipped.
 
-        # Start the scanning process in the background with track_id.  The
-        # task is responsible for clearing both flags in its finally block.
-        background_tasks.add_task(run_scanning_process, rag, doc_manager, track_id)
-        return ScanResponse(
-            status="scanning_started",
-            message="Scanning process has been initiated in the background",
-            track_id=track_id,
-        )
+                    background_tasks.add_task(_run_scanning_with_workspace)
+                    return ScanResponse(
+                        status="scanning_started",
+                        message="Scanning process has been initiated in the background",
+                        track_id=track_id,
+                    )
+                pipeline_status_lock = get_namespace_lock(
+                    "pipeline_status", workspace=rag.workspace
+                )
+
+                # Atomically acquire the scanning flag.  Scan is the exclusive
+                # writer in this contract — it reads doc_status to make
+                # classification decisions (PROCESSED / resume / retry-as-new /
+                # archive) and would race with concurrent writers — so refuse if:
+                #   * pipeline is processing (busy=True): scan + processing both
+                #     read/mutate doc_status; serialise.
+                #   * another scan is in flight (scanning=True).
+                #   * any /upload, /text, /texts endpoint has reserved a
+                #     pending-enqueue slot (see _reserve_enqueue_slot): the bg
+                #     task has not yet written doc_status and we would otherwise
+                #     race with its mid-flight write.
+                async with pipeline_status_lock:
+                    if pipeline_status.get("busy"):
+                        logger.warning(
+                            "Scan request skipped: pipeline is busy processing documents"
+                        )
+                        return ScanResponse(
+                            status="scanning_skipped_pipeline_busy",
+                            message=(
+                                "Pipeline is currently busy processing documents. "
+                                "Wait for the running job to finish before triggering another scan."
+                            ),
+                            track_id=track_id,
+                        )
+                    if pipeline_status.get("scanning"):
+                        logger.warning(
+                            "Scan request skipped: another scan is already in progress"
+                        )
+                        return ScanResponse(
+                            status="scanning_skipped_pipeline_busy",
+                            message=(
+                                "Another scan is already in progress. "
+                                "Wait for it to finish before triggering a new one."
+                            ),
+                            track_id=track_id,
+                        )
+                    pending_enqueues = pipeline_status.get("pending_enqueues", 0)
+                    if pending_enqueues > 0:
+                        logger.warning(
+                            "Scan request skipped: "
+                            f"{pending_enqueues} pending enqueue(s) reserved by "
+                            "upload/insert endpoints"
+                        )
+                        return ScanResponse(
+                            status="scanning_skipped_pipeline_busy",
+                            message=(
+                                "Document upload/insert is being enqueued. "
+                                "Wait for in-flight work to complete before triggering a scan."
+                            ),
+                            track_id=track_id,
+                        )
+                    # ``scanning`` covers the whole scan task lifecycle (used by
+                    # this endpoint to refuse overlapping scans).
+                    # ``scanning_exclusive`` is True only during the
+                    # classification phase: run_scanning_process clears it once
+                    # classification is done so concurrent uploads can land
+                    # while the scan-driven processing finishes.
+                    pipeline_status["scanning"] = True
+                    pipeline_status["scanning_exclusive"] = True
+
+                # Start the scanning process in the background with track_id.  The
+                # task is responsible for clearing both flags in its finally block.
+
+                background_tasks.add_task(_run_scanning_with_workspace)
+                return ScanResponse(
+                    status="scanning_started",
+                    message="Scanning process has been initiated in the background",
+                    track_id=track_id,
+                )
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.post(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
-        background_tasks: BackgroundTasks, file: UploadFile = File(...)
+        http_request: Request,
+        background_tasks: BackgroundTasks,
+        file: UploadFile = File(...),
     ):
         """
         Upload a file to the input directory and index it.
@@ -2660,182 +2701,213 @@ def create_document_routes(
                 conflict or scan-classifying / destructive job in
                 flight, 413 file too large, 500 other errors.
         """
-        slot_reserved = False
+        workspace = get_workspace_from_request(http_request)
+        # Build a per-request DocumentManager so the upload lands in this
+        # workspace's input directory rather than the default one.
+        ws_doc_manager = DocumentManager(
+            str(doc_manager.base_input_dir), workspace=workspace or ""
+        )
+        rag = None
         try:
-            # Reject upload while a scan is in its CLASSIFICATION
-            # phase or a destructive job (clear / per-doc delete) is
-            # in flight, AND reserve a pending-enqueue slot so a scan
-            # request that arrives before the bg task runs cannot
-            # transition scanning_exclusive=True under us.  Concurrent
-            # processing (``busy=True``) and a scan in its processing
-            # phase (``scanning=True`` with
-            # ``scanning_exclusive=False``) are permitted: the running
-            # loop's ``request_pending`` mechanism picks up our doc
-            # after the current batch.
-            slot_reserved = await _reserve_enqueue_slot(rag)
-
-            # Sanitize filename to prevent Path Traversal attacks
-            safe_filename = sanitize_filename(file.filename, doc_manager.input_dir)
-
+            rag = await workspace_mgr.acquire(workspace)
             try:
-                filename_supported = doc_manager.is_supported_file(safe_filename)
-            except FilenameParserHintError as hint_error:
-                # Reject malformed hints synchronously with the detailed
-                # message (previously surfaced asynchronously as an error
-                # document after the upload was accepted).
-                raise HTTPException(status_code=400, detail=str(hint_error))
-            if not filename_supported:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
-                )
+                slot_reserved = False
+                try:
+                    # Reject upload while a scan is in its CLASSIFICATION
+                    # phase or a destructive job (clear / per-doc delete) is
+                    # in flight, AND reserve a pending-enqueue slot so a scan
+                    # request that arrives before the bg task runs cannot
+                    # transition scanning_exclusive=True under us.  Concurrent
+                    # processing (``busy=True``) and a scan in its processing
+                    # phase (``scanning=True`` with
+                    # ``scanning_exclusive=False``) are permitted: the running
+                    # loop's ``request_pending`` mechanism picks up our doc
+                    # after the current batch.
+                    slot_reserved = await _reserve_enqueue_slot(rag)
 
-            # Check file size limit (if configured)
-            if (
-                global_args.max_upload_size is not None
-                and global_args.max_upload_size > 0
-            ):
-                # Safe access to file size (not available in older Starlette versions)
-                file_size = getattr(file, "size", None)
-
-                # Pre-flight size check (only if size is available)
-                if file_size is not None:
-                    if file_size > global_args.max_upload_size:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {file_size / 1024 / 1024:.1f}MB",
-                        )
-                else:
-                    # If size not available, we'll check during streaming
-                    logger.debug(
-                        f"File size not available in UploadFile for {safe_filename}, will check during streaming"
+                    # Sanitize filename to prevent Path Traversal attacks
+                    safe_filename = sanitize_filename(
+                        file.filename, ws_doc_manager.input_dir
                     )
 
-            file_path = doc_manager.input_dir / safe_filename
+                    try:
+                        filename_supported = ws_doc_manager.is_supported_file(
+                            safe_filename
+                        )
+                    except FilenameParserHintError as hint_error:
+                        # Reject malformed hints synchronously with the detailed
+                        # message (previously surfaced asynchronously as an error
+                        # document after the upload was accepted).
+                        raise HTTPException(status_code=400, detail=str(hint_error))
+                    if not filename_supported:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unsupported file type. Supported types: {ws_doc_manager.supported_extensions}",
+                        )
 
-            # Strict name pre-check.  Both the INPUT directory and doc_status
-            # must be free of any same-canonical-basename record before we
-            # accept the upload.  Replacing an existing document requires an
-            # explicit DELETE first; we no longer write a "duplicated" 200
-            # response that silently no-ops.
-            existing_doc_data = await get_existing_doc_by_file_path_candidates(
-                rag.doc_status, file_path
-            )
-            if existing_doc_data:
-                status = get_doc_status_value(existing_doc_data) or "unknown"
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Document storage already contains '{safe_filename}' "
-                        f"(Status: {status}). Delete the existing record before re-uploading."
-                    ),
-                )
-
-            # INPUT directory check, using canonical parser-hint names.
-            # Fast path: exact filename match avoids iterdir on large input directories.
-            canonical_filename = normalize_file_path(safe_filename)
-            if file_path.exists():
-                existing_input_file: Path | None = file_path
-            else:
-                existing_input_file = find_existing_file_by_file_path(
-                    doc_manager.input_dir, canonical_filename
-                )
-            if existing_input_file:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Input directory already contains a file with the same "
-                        f"canonical basename ('{existing_input_file.name}'). "
-                        f"Remove or rename it before re-uploading."
-                    ),
-                )
-
-            # Async streaming write with size check
-            bytes_written = 0
-            chunk_size = 1024 * 1024  # 1MB chunks
-            needs_cleanup = False
-
-            async with aiofiles.open(file_path, "wb") as out_file:
-                while True:
-                    # Read chunk from upload stream
-                    chunk = await file.read(chunk_size)
-                    if not chunk:
-                        break
-
-                    # Check size limit during streaming (if not checked before)
+                    # Check file size limit (if configured)
                     if (
                         global_args.max_upload_size is not None
                         and global_args.max_upload_size > 0
                     ):
-                        bytes_written += len(chunk)
-                        if bytes_written > global_args.max_upload_size:
-                            needs_cleanup = True
-                            break
+                        # Safe access to file size (not available in older Starlette versions)
+                        file_size = getattr(file, "size", None)
 
-                    # Write chunk to file
-                    await out_file.write(chunk)
+                        # Pre-flight size check (only if size is available)
+                        if file_size is not None:
+                            if file_size > global_args.max_upload_size:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {file_size / 1024 / 1024:.1f}MB",
+                                )
+                        else:
+                            # If size not available, we'll check during streaming
+                            logger.debug(
+                                f"File size not available in UploadFile for {safe_filename}, will check during streaming"
+                            )
 
-            # Cleanup after file is closed
-            if needs_cleanup:
-                try:
-                    file_path.unlink()
-                except Exception as cleanup_error:
-                    logger.error(
-                        f"Error cleaning up oversized file {safe_filename}: {cleanup_error}"
+                    file_path = ws_doc_manager.input_dir / safe_filename
+
+                    # Strict name pre-check.  Both the INPUT directory and doc_status
+                    # must be free of any same-canonical-basename record before we
+                    # accept the upload.  Replacing an existing document requires an
+                    # explicit DELETE first; we no longer write a "duplicated" 200
+                    # response that silently no-ops.
+                    existing_doc_data = await get_existing_doc_by_file_path_candidates(
+                        rag.doc_status, file_path
+                    )
+                    if existing_doc_data:
+                        status = get_doc_status_value(existing_doc_data) or "unknown"
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Document storage already contains '{safe_filename}' "
+                                f"(Status: {status}). Delete the existing record before re-uploading."
+                            ),
+                        )
+
+                    # INPUT directory check, using canonical parser-hint names.
+                    # Fast path: exact filename match avoids iterdir on large input directories.
+                    canonical_filename = normalize_file_path(safe_filename)
+                    if file_path.exists():
+                        existing_input_file: Path | None = file_path
+                    else:
+                        existing_input_file = find_existing_file_by_file_path(
+                            ws_doc_manager.input_dir, canonical_filename
+                        )
+                    if existing_input_file:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Input directory already contains a file with the same "
+                                f"canonical basename ('{existing_input_file.name}'). "
+                                f"Remove or rename it before re-uploading."
+                            ),
+                        )
+
+                    # Async streaming write with size check
+                    bytes_written = 0
+                    chunk_size = 1024 * 1024  # 1MB chunks
+                    needs_cleanup = False
+
+                    async with aiofiles.open(file_path, "wb") as out_file:
+                        while True:
+                            # Read chunk from upload stream
+                            chunk = await file.read(chunk_size)
+                            if not chunk:
+                                break
+
+                            # Check size limit during streaming (if not checked before)
+                            if (
+                                global_args.max_upload_size is not None
+                                and global_args.max_upload_size > 0
+                            ):
+                                bytes_written += len(chunk)
+                                if bytes_written > global_args.max_upload_size:
+                                    needs_cleanup = True
+                                    break
+
+                            # Write chunk to file
+                            await out_file.write(chunk)
+
+                    # Cleanup after file is closed
+                    if needs_cleanup:
+                        try:
+                            file_path.unlink()
+                        except Exception as cleanup_error:
+                            logger.error(
+                                f"Error cleaning up oversized file {safe_filename}: {cleanup_error}"
+                            )
+
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {bytes_written / 1024 / 1024:.1f}MB",
+                        )
+
+                    track_id = generate_track_id("upload")
+
+                    # Bg task: enqueue + trigger processing, then release the slot.
+                    # ``pipeline_index_file`` does both: it calls
+                    # ``pipeline_enqueue_file`` (writes doc_status / full_docs) and
+                    # then ``apipeline_process_enqueue_documents``.  The latter is
+                    # safe to invoke even when the loop is already busy — it
+                    # collapses to a ``request_pending=True`` nudge and returns,
+                    # so concurrent uploads/inserts cooperate via the running
+                    # loop's request_pending mechanism.
+                    async def _indexing_task():
+                        bg_rag = await workspace_mgr.acquire(workspace)
+                        try:
+                            await pipeline_index_file(bg_rag, file_path, track_id)
+                        finally:
+                            await _release_enqueue_slot(bg_rag)
+                            await workspace_mgr.release(workspace)
+
+                    background_tasks.add_task(_indexing_task)
+                    # Ownership of the slot transferred to the bg task — the
+                    # finally block below must NOT release it again.
+                    slot_reserved = False
+
+                    # Auto-register workspace so it appears in GET /workspaces
+                    registry = await workspace_mgr.get_registry()
+                    await registry.register(workspace)
+
+                    return InsertResponse(
+                        status="success",
+                        message=f"File '{safe_filename}' uploaded successfully. Processing will continue in background.",
+                        track_id=track_id,
                     )
 
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {bytes_written / 1024 / 1024:.1f}MB",
-                )
-
-            track_id = generate_track_id("upload")
-
-            # Bg task: enqueue + trigger processing, then release the slot.
-            # ``pipeline_index_file`` does both: it calls
-            # ``pipeline_enqueue_file`` (writes doc_status / full_docs) and
-            # then ``apipeline_process_enqueue_documents``.  The latter is
-            # safe to invoke even when the loop is already busy — it
-            # collapses to a ``request_pending=True`` nudge and returns,
-            # so concurrent uploads/inserts cooperate via the running
-            # loop's request_pending mechanism.
-            async def _indexing_task():
-                try:
-                    await pipeline_index_file(rag, file_path, track_id)
+                except HTTPException:
+                    # Re-raise HTTP exceptions (400, 413, etc.)
+                    raise
+                except Exception as e:
+                    logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    raise HTTPException(status_code=500, detail=str(e))
                 finally:
-                    await _release_enqueue_slot(rag)
-
-            background_tasks.add_task(_indexing_task)
-            # Ownership of the slot transferred to the bg task — the
-            # finally block below must NOT release it again.
-            slot_reserved = False
-
-            return InsertResponse(
-                status="success",
-                message=f"File '{safe_filename}' uploaded successfully. Processing will continue in background.",
-                track_id=track_id,
-            )
-
-        except HTTPException:
-            # Re-raise HTTP exceptions (400, 413, etc.)
-            raise
-        except Exception as e:
-            logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                    # If we reserved a slot but never scheduled the bg task
+                    # (e.g. early validation rejection or streaming-write
+                    # failure), release here.  No drain coordination needed —
+                    # any sibling bg task triggers its own processing pass.
+                    if slot_reserved:
+                        await _release_enqueue_slot(rag)
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
         finally:
-            # If we reserved a slot but never scheduled the bg task
-            # (e.g. early validation rejection or streaming-write
-            # failure), release here.  No drain coordination needed —
-            # any sibling bg task triggers its own processing pass.
-            if slot_reserved:
-                await _release_enqueue_slot(rag)
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.post(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def insert_text(
-        request: InsertTextRequest, background_tasks: BackgroundTasks
+        http_request: Request,
+        request: InsertTextRequest,
+        background_tasks: BackgroundTasks,
     ):
         """
         Insert text into the RAG system.
@@ -2863,75 +2935,95 @@ def create_document_routes(
             HTTPException: 400 invalid file_source, 409 same-name conflict
                 or scan/destructive job in flight, 500 other errors.
         """
-        slot_reserved = False
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            # Reject text insertion while a scan is in progress AND reserve
-            # a pending-enqueue slot — see /upload for the rationale.
-            slot_reserved = await _reserve_enqueue_slot(rag)
-
-            # Check if file_source already exists in doc_status storage
-            if not is_valid_file_source(request.file_source):
-                raise HTTPException(
-                    status_code=400,
-                    detail="A valid file_source is required for text insertion",
-                )
-
-            normalized_file_source = normalize_file_path(request.file_source)
-            existing_doc_data = await get_existing_doc_by_file_path_candidates(
-                rag.doc_status, normalized_file_source
-            )
-            if existing_doc_data:
-                status = get_doc_status_value(existing_doc_data) or "unknown"
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Document storage already contains '{normalized_file_source}' "
-                        f"(Status: {status}). Delete the existing record before re-inserting."
-                    ),
-                )
-
-            # Resolve + validate chunking synchronously so an invalid
-            # effective config (e.g. chunk_token_size below the inherited
-            # overlap) fails with HTTP 422 here, before any background work is
-            # scheduled. pipeline_index_texts re-resolves from the same
-            # addon_params inside the task.
+            rag = await workspace_mgr.acquire(workspace)
             try:
-                _resolve_text_chunking(request.chunking, rag)
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc))
-
-            # Generate track_id for text insertion
-            track_id = generate_track_id("insert")
-
-            async def _indexing_task():
+                slot_reserved = False
                 try:
-                    await pipeline_index_texts(
-                        rag,
-                        [request.text],
-                        file_sources=[normalized_file_source],
-                        track_id=track_id,
-                        chunking=request.chunking,
+                    # Reject text insertion while a scan is in progress AND reserve
+                    # a pending-enqueue slot — see /upload for the rationale.
+                    slot_reserved = await _reserve_enqueue_slot(rag)
+
+                    # Check if file_source already exists in doc_status storage
+                    if not is_valid_file_source(request.file_source):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="A valid file_source is required for text insertion",
+                        )
+
+                    normalized_file_source = normalize_file_path(request.file_source)
+                    existing_doc_data = await get_existing_doc_by_file_path_candidates(
+                        rag.doc_status, normalized_file_source
                     )
+                    if existing_doc_data:
+                        status = get_doc_status_value(existing_doc_data) or "unknown"
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Document storage already contains '{normalized_file_source}' "
+                                f"(Status: {status}). Delete the existing record before re-inserting."
+                            ),
+                        )
+
+                    # Resolve + validate chunking synchronously so an invalid
+                    # effective config (e.g. chunk_token_size below the inherited
+                    # overlap) fails with HTTP 422 here, before any background work is
+                    # scheduled. pipeline_index_texts re-resolves from the same
+                    # addon_params inside the task.
+                    try:
+                        _resolve_text_chunking(request.chunking, rag)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc))
+
+                    # Generate track_id for text insertion
+                    track_id = generate_track_id("insert")
+
+                    async def _indexing_task():
+                        bg_rag = await workspace_mgr.acquire(workspace)
+                        try:
+                            await pipeline_index_texts(
+                                bg_rag,
+                                [request.text],
+                                file_sources=[normalized_file_source],
+                                track_id=track_id,
+                                chunking=request.chunking,
+                            )
+                        finally:
+                            await _release_enqueue_slot(bg_rag)
+                            await workspace_mgr.release(workspace)
+
+                    background_tasks.add_task(_indexing_task)
+                    slot_reserved = False
+
+                    # Auto-register workspace so it appears in GET /workspaces
+                    registry = await workspace_mgr.get_registry()
+                    await registry.register(workspace)
+
+                    return InsertResponse(
+                        status="success",
+                        message="Text successfully received. Processing will continue in background.",
+                        track_id=track_id,
+                    )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error /documents/text: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    raise HTTPException(status_code=500, detail=str(e))
                 finally:
-                    await _release_enqueue_slot(rag)
-
-            background_tasks.add_task(_indexing_task)
-            slot_reserved = False
-
-            return InsertResponse(
-                status="success",
-                message="Text successfully received. Processing will continue in background.",
-                track_id=track_id,
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error /documents/text: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                    if slot_reserved:
+                        await _release_enqueue_slot(rag)
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
         finally:
-            if slot_reserved:
-                await _release_enqueue_slot(rag)
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.post(
         "/texts",
@@ -2939,7 +3031,9 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def insert_texts(
-        request: InsertTextsRequest, background_tasks: BackgroundTasks
+        http_request: Request,
+        request: InsertTextsRequest,
+        background_tasks: BackgroundTasks,
     ):
         """
         Insert multiple texts into the RAG system.
@@ -2968,99 +3062,126 @@ def create_document_routes(
                 conflict or scan/destructive job in flight, 500 other
                 errors.
         """
-        slot_reserved = False
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            # Reject batch text insertion while a scan is in progress AND
-            # reserve a pending-enqueue slot — see /upload for the rationale.
-            slot_reserved = await _reserve_enqueue_slot(rag)
-
-            # Check if any file_sources already exist in doc_status storage
-            if not request.file_sources or len(request.file_sources) != len(
-                request.texts
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="A valid file_source is required for each text",
-                )
-
-            normalized_file_sources = [
-                normalize_file_path(file_source) for file_source in request.file_sources
-            ]
-            if any(
-                file_source == UNKNOWN_FILE_SOURCE
-                for file_source in normalized_file_sources
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="A valid file_source is required for each text",
-                )
-            if len(set(normalized_file_sources)) != len(normalized_file_sources):
-                raise HTTPException(
-                    status_code=400,
-                    detail="file_sources must be unique by filename",
-                )
-
-            for file_source in normalized_file_sources:
-                existing_doc_data = await get_existing_doc_by_file_path_candidates(
-                    rag.doc_status, file_source
-                )
-                if existing_doc_data:
-                    status = get_doc_status_value(existing_doc_data) or "unknown"
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Document storage already contains '{file_source}' "
-                            f"(Status: {status}). Delete the existing record before re-inserting."
-                        ),
-                    )
-
-            # Resolve + validate the shared chunking synchronously so an
-            # invalid effective config (e.g. chunk_token_size below the
-            # inherited overlap) fails with HTTP 422 here, before any
-            # background work is scheduled. pipeline_index_texts re-resolves
-            # from the same addon_params inside the task.
+            rag = await workspace_mgr.acquire(workspace)
             try:
-                _resolve_text_chunking(request.chunking, rag)
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc))
-
-            # Generate track_id for texts insertion
-            track_id = generate_track_id("insert")
-
-            async def _indexing_task():
+                slot_reserved = False
                 try:
-                    await pipeline_index_texts(
-                        rag,
-                        request.texts,
-                        file_sources=normalized_file_sources,
+                    # Reject batch text insertion while a scan is in progress AND
+                    # reserve a pending-enqueue slot — see /upload for the rationale.
+                    slot_reserved = await _reserve_enqueue_slot(rag)
+
+                    # Check if any file_sources already exist in doc_status storage
+                    if not request.file_sources or len(request.file_sources) != len(
+                        request.texts
+                    ):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="A valid file_source is required for each text",
+                        )
+
+                    normalized_file_sources = [
+                        normalize_file_path(file_source)
+                        for file_source in request.file_sources
+                    ]
+                    if any(
+                        file_source == UNKNOWN_FILE_SOURCE
+                        for file_source in normalized_file_sources
+                    ):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="A valid file_source is required for each text",
+                        )
+                    if len(set(normalized_file_sources)) != len(
+                        normalized_file_sources
+                    ):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="file_sources must be unique by filename",
+                        )
+
+                    for file_source in normalized_file_sources:
+                        existing_doc_data = (
+                            await get_existing_doc_by_file_path_candidates(
+                                rag.doc_status, file_source
+                            )
+                        )
+                        if existing_doc_data:
+                            status = (
+                                get_doc_status_value(existing_doc_data) or "unknown"
+                            )
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    f"Document storage already contains '{file_source}' "
+                                    f"(Status: {status}). Delete the existing record before re-inserting."
+                                ),
+                            )
+
+                    # Resolve + validate the shared chunking synchronously so an
+                    # invalid effective config (e.g. chunk_token_size below the
+                    # inherited overlap) fails with HTTP 422 here, before any
+                    # background work is scheduled. pipeline_index_texts re-resolves
+                    # from the same addon_params inside the task.
+                    try:
+                        _resolve_text_chunking(request.chunking, rag)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc))
+
+                    # Generate track_id for texts insertion
+                    track_id = generate_track_id("insert")
+
+                    async def _indexing_task():
+                        bg_rag = await workspace_mgr.acquire(workspace)
+                        try:
+                            await pipeline_index_texts(
+                                bg_rag,
+                                request.texts,
+                                file_sources=normalized_file_sources,
+                                track_id=track_id,
+                                chunking=request.chunking,
+                            )
+                        finally:
+                            await _release_enqueue_slot(bg_rag)
+                            await workspace_mgr.release(workspace)
+
+                    background_tasks.add_task(_indexing_task)
+                    slot_reserved = False
+
+                    # Auto-register workspace so it appears in GET /workspaces
+                    registry = await workspace_mgr.get_registry()
+                    await registry.register(workspace)
+
+                    return InsertResponse(
+                        status="success",
+                        message="Texts successfully received. Processing will continue in background.",
                         track_id=track_id,
-                        chunking=request.chunking,
                     )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error /documents/texts: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    raise HTTPException(status_code=500, detail=str(e))
                 finally:
-                    await _release_enqueue_slot(rag)
-
-            background_tasks.add_task(_indexing_task)
-            slot_reserved = False
-
-            return InsertResponse(
-                status="success",
-                message="Texts successfully received. Processing will continue in background.",
-                track_id=track_id,
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error /documents/texts: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                    if slot_reserved:
+                        await _release_enqueue_slot(rag)
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
         finally:
-            if slot_reserved:
-                await _release_enqueue_slot(rag)
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents():
+    async def clear_documents(http_request: Request):
         """
         Clear all documents from the RAG system.
 
@@ -3093,199 +3214,227 @@ def create_document_routes(
             HTTPException: Raised when a serious error occurs during the clearing process,
                           with status code 500 and error details in the detail field.
         """
-        from lightrag.kg.shared_storage import (
-            get_namespace_data,
-            get_namespace_lock,
+        workspace = get_workspace_from_request(http_request)
+        # Build a per-request DocumentManager so file deletion targets this
+        # workspace's input directory rather than the default one.
+        ws_doc_manager = DocumentManager(
+            str(doc_manager.base_input_dir), workspace=workspace or ""
         )
-
-        # Get pipeline status and lock
-        pipeline_status = await get_namespace_data(
-            "pipeline_status", workspace=rag.workspace
-        )
-        pipeline_status_lock = get_namespace_lock(
-            "pipeline_status", workspace=rag.workspace
-        )
-
-        # Atomically reserve the destructive slot.  Checks busy +
-        # scanning + pending_enqueues>0 in a single critical section
-        # before flipping busy=True and destructive_busy=True together.
-        # ``destructive_busy`` blocks reservation and the enqueue
-        # last-line guard: clear is about to drop every storage and
-        # remove every input file, so a concurrent upload accepted in
-        # this window would write to storages mid-drop and silently
-        # lose the document.
-        acquired, reason = await _acquire_destructive_busy(rag)
-        if not acquired:
-            return ClearDocumentsResponse(status="busy", message=reason)
-        async with pipeline_status_lock:
-            pipeline_status.update(
-                {
-                    "job_name": "Clearing Documents",
-                    "job_start": datetime.now().isoformat(),
-                    "docs": 0,
-                    "batchs": 0,
-                    "cur_batch": 0,
-                    "request_pending": False,  # Clear any previous request
-                    "latest_message": "Starting document clearing process",
-                }
-            )
-            # Cleaning history_messages without breaking it as a shared list object
-            del pipeline_status["history_messages"][:]
-            pipeline_status["history_messages"].append(
-                "Starting document clearing process"
-            )
-
+        rag = None
         try:
-            # Use drop method to clear all data
-            drop_tasks = []
-            storages = [
-                rag.text_chunks,
-                rag.full_docs,
-                rag.full_entities,
-                rag.full_relations,
-                rag.entity_chunks,
-                rag.relation_chunks,
-                rag.entities_vdb,
-                rag.relationships_vdb,
-                rag.chunks_vdb,
-                rag.chunk_entity_relation_graph,
-                rag.doc_status,
-            ]
-
-            # Log storage drop start
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(
-                    "Starting to drop storage components"
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                from lightrag.kg.shared_storage import (
+                    get_namespace_data,
+                    get_namespace_lock,
                 )
 
-            for storage in storages:
-                if storage is not None:
-                    drop_tasks.append(storage.drop())
-
-            # Wait for all drop tasks to complete
-            drop_results = await asyncio.gather(*drop_tasks, return_exceptions=True)
-
-            # Check for errors and log results
-            errors = []
-            storage_success_count = 0
-            storage_error_count = 0
-
-            for i, result in enumerate(drop_results):
-                storage_name = storages[i].__class__.__name__
-                if isinstance(result, Exception):
-                    error_msg = f"Error dropping {storage_name}: {str(result)}"
-                    errors.append(error_msg)
-                    logger.error(error_msg)
-                    storage_error_count += 1
-                elif isinstance(result, dict) and result.get("status") != "success":
-                    # drop() reports a non-raising failure as {"status": "error"}
-                    # (e.g. a backend that could not safely clear a kept legacy
-                    # store). Honor it so the clear is not counted as successful
-                    # while stale data remains and could be re-migrated/resurface.
-                    error_msg = (
-                        f"Error dropping {storage_name}: "
-                        f"{result.get('message', 'unknown error')}"
-                    )
-                    errors.append(error_msg)
-                    logger.error(error_msg)
-                    storage_error_count += 1
-                else:
-                    namespace = storages[i].namespace
-                    workspace = storages[i].workspace
-                    logger.info(
-                        f"Successfully dropped {storage_name}: {workspace}/{namespace}"
-                    )
-                    storage_success_count += 1
-
-            # Log storage drop results
-            if "history_messages" in pipeline_status:
-                if storage_error_count > 0:
-                    pipeline_status["history_messages"].append(
-                        f"Dropped {storage_success_count} storage components with {storage_error_count} errors"
-                    )
-                else:
-                    pipeline_status["history_messages"].append(
-                        f"Successfully dropped all {storage_success_count} storage components"
-                    )
-
-            # If all storage operations failed, return error status and don't proceed with file deletion
-            if storage_success_count == 0 and storage_error_count > 0:
-                error_message = "All storage drop operations failed. Aborting document clearing process."
-                logger.error(error_message)
-                if "history_messages" in pipeline_status:
-                    pipeline_status["history_messages"].append(error_message)
-                return ClearDocumentsResponse(status="fail", message=error_message)
-
-            # Log file deletion start
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(
-                    "Starting to delete files in input directory"
+                # Get pipeline status and lock
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=rag.workspace
+                )
+                pipeline_status_lock = get_namespace_lock(
+                    "pipeline_status", workspace=rag.workspace
                 )
 
-            # Delete only files in the current directory, preserve files in subdirectories
-            deleted_files_count = 0
-            file_errors_count = 0
-
-            for file_path in doc_manager.input_dir.glob("*"):
-                if file_path.is_file():
-                    try:
-                        file_path.unlink()
-                        deleted_files_count += 1
-                    except Exception as e:
-                        logger.error(f"Error deleting file {file_path}: {str(e)}")
-                        file_errors_count += 1
-
-            # Log file deletion results
-            if "history_messages" in pipeline_status:
-                if file_errors_count > 0:
-                    pipeline_status["history_messages"].append(
-                        f"Deleted {deleted_files_count} files with {file_errors_count} errors"
+                # Atomically reserve the destructive slot.  Checks busy +
+                # scanning + pending_enqueues>0 in a single critical section
+                # before flipping busy=True and destructive_busy=True together.
+                # ``destructive_busy`` blocks reservation and the enqueue
+                # last-line guard: clear is about to drop every storage and
+                # remove every input file, so a concurrent upload accepted in
+                # this window would write to storages mid-drop and silently
+                # lose the document.
+                acquired, reason = await _acquire_destructive_busy(rag)
+                if not acquired:
+                    return ClearDocumentsResponse(status="busy", message=reason)
+                async with pipeline_status_lock:
+                    pipeline_status.update(
+                        {
+                            "job_name": "Clearing Documents",
+                            "job_start": datetime.now().isoformat(),
+                            "docs": 0,
+                            "batchs": 0,
+                            "cur_batch": 0,
+                            "request_pending": False,  # Clear any previous request
+                            "latest_message": "Starting document clearing process",
+                        }
                     )
-                    errors.append(f"Failed to delete {file_errors_count} files")
-                else:
+                    # Cleaning history_messages without breaking it as a shared list object
+                    del pipeline_status["history_messages"][:]
                     pipeline_status["history_messages"].append(
-                        f"Successfully deleted {deleted_files_count} files"
+                        "Starting document clearing process"
                     )
 
-            # Prepare final result message
-            final_message = ""
-            if errors:
-                final_message = f"Cleared documents with some errors. Deleted {deleted_files_count} files."
-                status = "partial_success"
-            else:
-                final_message = f"All documents cleared successfully. Deleted {deleted_files_count} files."
-                status = "success"
+                try:
+                    # Use drop method to clear all data
+                    drop_tasks = []
+                    storages = [
+                        rag.text_chunks,
+                        rag.full_docs,
+                        rag.full_entities,
+                        rag.full_relations,
+                        rag.entity_chunks,
+                        rag.relation_chunks,
+                        rag.entities_vdb,
+                        rag.relationships_vdb,
+                        rag.chunks_vdb,
+                        rag.chunk_entity_relation_graph,
+                        rag.doc_status,
+                    ]
 
-            # Log final result
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(final_message)
+                    # Log storage drop start
+                    if "history_messages" in pipeline_status:
+                        pipeline_status["history_messages"].append(
+                            "Starting to drop storage components"
+                        )
 
-            # Return response based on results
-            return ClearDocumentsResponse(status=status, message=final_message)
-        except Exception as e:
-            error_msg = f"Error clearing documents: {str(e)}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(error_msg)
-            raise HTTPException(status_code=500, detail=str(e))
+                    for storage in storages:
+                        if storage is not None:
+                            drop_tasks.append(storage.drop())
+
+                    # Wait for all drop tasks to complete
+                    drop_results = await asyncio.gather(
+                        *drop_tasks, return_exceptions=True
+                    )
+
+                    # Check for errors and log results
+                    errors = []
+                    storage_success_count = 0
+                    storage_error_count = 0
+
+                    for i, result in enumerate(drop_results):
+                        storage_name = storages[i].__class__.__name__
+                        if isinstance(result, Exception):
+                            error_msg = f"Error dropping {storage_name}: {str(result)}"
+                            errors.append(error_msg)
+                            logger.error(error_msg)
+                            storage_error_count += 1
+                        elif (
+                            isinstance(result, dict)
+                            and result.get("status") != "success"
+                        ):
+                            # drop() reports a non-raising failure as {"status": "error"}
+                            # (e.g. a backend that could not safely clear a kept legacy
+                            # store). Honor it so the clear is not counted as successful
+                            # while stale data remains and could be re-migrated/resurface.
+                            error_msg = (
+                                f"Error dropping {storage_name}: "
+                                f"{result.get('message', 'unknown error')}"
+                            )
+                            errors.append(error_msg)
+                            logger.error(error_msg)
+                            storage_error_count += 1
+                        else:
+                            namespace = storages[i].namespace
+                            workspace = storages[i].workspace
+                            logger.info(
+                                f"Successfully dropped {storage_name}: {workspace}/{namespace}"
+                            )
+                            storage_success_count += 1
+
+                    # Log storage drop results
+                    if "history_messages" in pipeline_status:
+                        if storage_error_count > 0:
+                            pipeline_status["history_messages"].append(
+                                f"Dropped {storage_success_count} storage components with {storage_error_count} errors"
+                            )
+                        else:
+                            pipeline_status["history_messages"].append(
+                                f"Successfully dropped all {storage_success_count} storage components"
+                            )
+
+                    # If all storage operations failed, return error status and don't proceed with file deletion
+                    if storage_success_count == 0 and storage_error_count > 0:
+                        error_message = "All storage drop operations failed. Aborting document clearing process."
+                        logger.error(error_message)
+                        if "history_messages" in pipeline_status:
+                            pipeline_status["history_messages"].append(error_message)
+                        return ClearDocumentsResponse(
+                            status="fail", message=error_message
+                        )
+
+                    # Log file deletion start
+                    if "history_messages" in pipeline_status:
+                        pipeline_status["history_messages"].append(
+                            "Starting to delete files in input directory"
+                        )
+
+                    # Delete only files in the current directory, preserve files in subdirectories
+                    deleted_files_count = 0
+                    file_errors_count = 0
+
+                    for file_path in ws_doc_manager.input_dir.glob("*"):
+                        if file_path.is_file():
+                            try:
+                                file_path.unlink()
+                                deleted_files_count += 1
+                            except Exception as e:
+                                logger.error(
+                                    f"Error deleting file {file_path}: {str(e)}"
+                                )
+                                file_errors_count += 1
+
+                    # Log file deletion results
+                    if "history_messages" in pipeline_status:
+                        if file_errors_count > 0:
+                            pipeline_status["history_messages"].append(
+                                f"Deleted {deleted_files_count} files with {file_errors_count} errors"
+                            )
+                            errors.append(f"Failed to delete {file_errors_count} files")
+                        else:
+                            pipeline_status["history_messages"].append(
+                                f"Successfully deleted {deleted_files_count} files"
+                            )
+
+                    # Prepare final result message
+                    final_message = ""
+                    if errors:
+                        final_message = f"Cleared documents with some errors. Deleted {deleted_files_count} files."
+                        status = "partial_success"
+                    else:
+                        final_message = f"All documents cleared successfully. Deleted {deleted_files_count} files."
+                        status = "success"
+
+                    # Log final result
+                    if "history_messages" in pipeline_status:
+                        pipeline_status["history_messages"].append(final_message)
+
+                    # Return response based on results
+                    return ClearDocumentsResponse(status=status, message=final_message)
+                except Exception as e:
+                    error_msg = f"Error clearing documents: {str(e)}"
+                    logger.error(error_msg)
+                    logger.error(traceback.format_exc())
+                    if "history_messages" in pipeline_status:
+                        pipeline_status["history_messages"].append(error_msg)
+                    raise HTTPException(status_code=500, detail=str(e))
+                finally:
+                    # Reset busy + destructive_busy after completion so the next
+                    # reservation / scan sees an idle pipeline.
+                    async with pipeline_status_lock:
+                        pipeline_status["busy"] = False
+                        pipeline_status["destructive_busy"] = False
+                        completion_msg = "Document clearing process completed"
+                        pipeline_status["latest_message"] = completion_msg
+                        if "history_messages" in pipeline_status:
+                            pipeline_status["history_messages"].append(completion_msg)
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
         finally:
-            # Reset busy + destructive_busy after completion so the next
-            # reservation / scan sees an idle pipeline.
-            async with pipeline_status_lock:
-                pipeline_status["busy"] = False
-                pipeline_status["destructive_busy"] = False
-                completion_msg = "Document clearing process completed"
-                pipeline_status["latest_message"] = completion_msg
-                if "history_messages" in pipeline_status:
-                    pipeline_status["history_messages"].append(completion_msg)
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.get(
         "/pipeline_status",
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
     )
-    async def get_pipeline_status() -> PipelineStatusResponse:
+    async def get_pipeline_status(http_request: Request) -> PipelineStatusResponse:
         """
         Get the current status of the document indexing pipeline.
 
@@ -3309,82 +3458,91 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving pipeline status (500)
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            from lightrag.kg.shared_storage import (
-                get_namespace_data,
-                get_namespace_lock,
-                get_all_update_flags_status,
-            )
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                from lightrag.kg.shared_storage import (
+                    get_namespace_data,
+                    get_namespace_lock,
+                    get_all_update_flags_status,
+                )
 
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
-            )
-            pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
-            )
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=rag.workspace
+                )
+                pipeline_status_lock = get_namespace_lock(
+                    "pipeline_status", workspace=rag.workspace
+                )
 
-            # Get update flags status for all namespaces
-            update_status = await get_all_update_flags_status(workspace=rag.workspace)
+                # Get update flags status for all namespaces
+                update_status = await get_all_update_flags_status(
+                    workspace=rag.workspace
+                )
 
-            # Convert MutableBoolean objects to regular boolean values
-            processed_update_status = {}
-            for namespace, flags in update_status.items():
-                processed_flags = []
-                for flag in flags:
-                    # Handle both multiprocess and single process cases
-                    if hasattr(flag, "value"):
-                        processed_flags.append(bool(flag.value))
+                # Convert MutableBoolean objects to regular boolean values
+                processed_update_status = {}
+                for namespace, flags in update_status.items():
+                    processed_flags = []
+                    for flag in flags:
+                        # Handle both multiprocess and single process cases
+                        if hasattr(flag, "value"):
+                            processed_flags.append(bool(flag.value))
+                        else:
+                            processed_flags.append(bool(flag))
+                    processed_update_status[namespace] = processed_flags
+
+                async with pipeline_status_lock:
+                    # Convert to regular dict if it's a Manager.dict
+                    status_dict = dict(pipeline_status)
+
+                # Add processed update_status to the status dictionary
+                status_dict["update_status"] = processed_update_status
+
+                # Convert history_messages to a regular list if it's a Manager.list
+                # and limit to latest 1000 entries with truncation message if needed
+                if "history_messages" in status_dict:
+                    history_list = list(status_dict["history_messages"])
+                    total_count = len(history_list)
+
+                    if total_count > 1000:
+                        # Calculate truncated message count
+                        truncated_count = total_count - 1000
+
+                        # Take only the latest 1000 messages
+                        latest_messages = history_list[-1000:]
+
+                        # Add truncation message at the beginning
+                        truncation_message = f"[Truncated history messages: {truncated_count}/{total_count}]"
+                        status_dict["history_messages"] = [
+                            truncation_message
+                        ] + latest_messages
                     else:
-                        processed_flags.append(bool(flag))
-                processed_update_status[namespace] = processed_flags
+                        # No truncation needed, return all messages
+                        status_dict["history_messages"] = history_list
 
-            async with pipeline_status_lock:
-                # Convert to regular dict if it's a Manager.dict
-                status_dict = dict(pipeline_status)
+                # Ensure job_start is properly formatted as a string with timezone information
+                if "job_start" in status_dict and status_dict["job_start"]:
+                    # Use format_datetime to ensure consistent formatting
+                    status_dict["job_start"] = format_datetime(status_dict["job_start"])
 
-            # Add processed update_status to the status dictionary
-            status_dict["update_status"] = processed_update_status
-
-            # Convert history_messages to a regular list if it's a Manager.list
-            # and limit to latest 1000 entries with truncation message if needed
-            if "history_messages" in status_dict:
-                history_list = list(status_dict["history_messages"])
-                total_count = len(history_list)
-
-                if total_count > 1000:
-                    # Calculate truncated message count
-                    truncated_count = total_count - 1000
-
-                    # Take only the latest 1000 messages
-                    latest_messages = history_list[-1000:]
-
-                    # Add truncation message at the beginning
-                    truncation_message = (
-                        f"[Truncated history messages: {truncated_count}/{total_count}]"
-                    )
-                    status_dict["history_messages"] = [
-                        truncation_message
-                    ] + latest_messages
-                else:
-                    # No truncation needed, return all messages
-                    status_dict["history_messages"] = history_list
-
-            # Ensure job_start is properly formatted as a string with timezone information
-            if "job_start" in status_dict and status_dict["job_start"]:
-                # Use format_datetime to ensure consistent formatting
-                status_dict["job_start"] = format_datetime(status_dict["job_start"])
-
-            return PipelineStatusResponse(**status_dict)
-        except Exception as e:
-            logger.error(f"Error getting pipeline status: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                return PipelineStatusResponse(**status_dict)
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     # TODO: Deprecated, use /documents/paginated instead
     @router.get(
         "", response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)]
     )
-    async def documents() -> DocsStatusesResponse:
+    async def documents(http_request: Request) -> DocsStatusesResponse:
         """
         Get the status of all documents in the system. This endpoint is deprecated; use /documents/paginated instead.
         To prevent excessive resource consumption, a maximum of 1,000 records is returned.
@@ -3402,87 +3560,100 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving document statuses (500).
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            statuses = (
-                DocStatus.PENDING,
-                DocStatus.PARSING,
-                DocStatus.ANALYZING,
-                DocStatus.PROCESSING,
-                DocStatus.PREPROCESSED,
-                DocStatus.PROCESSED,
-                DocStatus.FAILED,
-            )
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                statuses = (
+                    DocStatus.PENDING,
+                    DocStatus.PARSING,
+                    DocStatus.ANALYZING,
+                    DocStatus.PROCESSING,
+                    DocStatus.PREPROCESSED,
+                    DocStatus.PROCESSED,
+                    DocStatus.FAILED,
+                )
 
-            tasks = [rag.get_docs_by_status(status) for status in statuses]
-            results: List[Dict[str, DocProcessingStatus]] = await asyncio.gather(*tasks)
+                tasks = [rag.get_docs_by_status(status) for status in statuses]
+                results: List[Dict[str, DocProcessingStatus]] = await asyncio.gather(
+                    *tasks
+                )
 
-            response = DocsStatusesResponse()
-            total_documents = 0
-            max_documents = 1000
+                response = DocsStatusesResponse()
+                total_documents = 0
+                max_documents = 1000
 
-            # Convert results to lists for easier processing
-            status_documents = []
-            for idx, result in enumerate(results):
-                status = statuses[idx]
-                docs_list = []
-                for doc_id, doc_status in result.items():
-                    docs_list.append((doc_id, doc_status))
-                status_documents.append((status, docs_list))
+                # Convert results to lists for easier processing
+                status_documents = []
+                for idx, result in enumerate(results):
+                    status = statuses[idx]
+                    docs_list = []
+                    for doc_id, doc_status in result.items():
+                        docs_list.append((doc_id, doc_status))
+                    status_documents.append((status, docs_list))
 
-            # Fair distribution: round-robin across statuses
-            status_indices = [0] * len(
-                status_documents
-            )  # Track current index for each status
-            current_status_idx = 0
+                # Fair distribution: round-robin across statuses
+                status_indices = [0] * len(
+                    status_documents
+                )  # Track current index for each status
+                current_status_idx = 0
 
-            while total_documents < max_documents:
-                # Check if we have any documents left to process
-                has_remaining = False
-                for status_idx, (status, docs_list) in enumerate(status_documents):
-                    if status_indices[status_idx] < len(docs_list):
-                        has_remaining = True
+                while total_documents < max_documents:
+                    # Check if we have any documents left to process
+                    has_remaining = False
+                    for status_idx, (status, docs_list) in enumerate(status_documents):
+                        if status_indices[status_idx] < len(docs_list):
+                            has_remaining = True
+                            break
+
+                    if not has_remaining:
                         break
 
-                if not has_remaining:
-                    break
+                    # Try to get a document from the current status
+                    status, docs_list = status_documents[current_status_idx]
+                    current_index = status_indices[current_status_idx]
 
-                # Try to get a document from the current status
-                status, docs_list = status_documents[current_status_idx]
-                current_index = status_indices[current_status_idx]
+                    if current_index < len(docs_list):
+                        doc_id, doc_status = docs_list[current_index]
 
-                if current_index < len(docs_list):
-                    doc_id, doc_status = docs_list[current_index]
+                        if status not in response.statuses:
+                            response.statuses[status] = []
 
-                    if status not in response.statuses:
-                        response.statuses[status] = []
-
-                    response.statuses[status].append(
-                        DocStatusResponse(
-                            id=doc_id,
-                            content_summary=doc_status.content_summary,
-                            content_length=doc_status.content_length,
-                            status=doc_status.status,
-                            created_at=format_datetime(doc_status.created_at),
-                            updated_at=format_datetime(doc_status.updated_at),
-                            track_id=doc_status.track_id,
-                            chunks_count=doc_status.chunks_count,
-                            error_msg=doc_status.error_msg,
-                            metadata=doc_status.metadata,
-                            file_path=normalize_file_path(doc_status.file_path),
+                        response.statuses[status].append(
+                            DocStatusResponse(
+                                id=doc_id,
+                                content_summary=doc_status.content_summary,
+                                content_length=doc_status.content_length,
+                                status=doc_status.status,
+                                created_at=format_datetime(doc_status.created_at),
+                                updated_at=format_datetime(doc_status.updated_at),
+                                track_id=doc_status.track_id,
+                                chunks_count=doc_status.chunks_count,
+                                error_msg=doc_status.error_msg,
+                                metadata=doc_status.metadata,
+                                file_path=normalize_file_path(doc_status.file_path),
+                            )
                         )
+
+                        status_indices[current_status_idx] += 1
+                        total_documents += 1
+
+                    # Move to next status (round-robin)
+                    current_status_idx = (current_status_idx + 1) % len(
+                        status_documents
                     )
 
-                    status_indices[current_status_idx] += 1
-                    total_documents += 1
-
-                # Move to next status (round-robin)
-                current_status_idx = (current_status_idx + 1) % len(status_documents)
-
-            return response
-        except Exception as e:
-            logger.error(f"Error GET /documents: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                return response
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     class DeleteDocByIdResponse(BaseModel):
         """Response model for single document deletion operation."""
@@ -3500,6 +3671,7 @@ def create_document_routes(
         summary="Delete a document and all its associated data by its ID.",
     )
     async def delete_document(
+        http_request: Request,
         delete_request: DeleteDocRequest,
         background_tasks: BackgroundTasks,
     ) -> DeleteDocByIdResponse:
@@ -3536,63 +3708,89 @@ def create_document_routes(
             HTTPException:
               - 500: If an unexpected internal error occurs during initialization.
         """
-        doc_ids = delete_request.doc_ids
-
-        slot_acquired = False
+        workspace = get_workspace_from_request(http_request)
+        # Build a per-request DocumentManager so source-file deletion in the
+        # bg task targets this workspace's input directory.
+        ws_doc_manager = DocumentManager(
+            str(doc_manager.base_input_dir), workspace=workspace or ""
+        )
+        rag = None
         try:
-            # Atomically reserve the destructive slot BEFORE returning
-            # ``deletion_started``.  Without this, the bg task would set
-            # destructive_busy only when it later runs — leaving a
-            # window where a /scan or /upload can race the delete after
-            # the client has already received success.  The check
-            # covers busy + scanning + pending_enqueues>0 in a single
-            # critical section.
-            acquired, reason = await _acquire_destructive_busy(rag)
-            if not acquired:
-                return DeleteDocByIdResponse(
-                    status="busy",
-                    message=reason or "Cannot delete documents while pipeline is busy",
-                    doc_id=", ".join(doc_ids),
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                doc_ids = delete_request.doc_ids
+
+                slot_acquired = False
+                try:
+                    # Atomically reserve the destructive slot BEFORE returning
+                    # ``deletion_started``.  Without this, the bg task would set
+                    # destructive_busy only when it later runs — leaving a
+                    # window where a /scan or /upload can race the delete after
+                    # the client has already received success.  The check
+                    # covers busy + scanning + pending_enqueues>0 in a single
+                    # critical section.
+                    acquired, reason = await _acquire_destructive_busy(rag)
+                    if not acquired:
+                        return DeleteDocByIdResponse(
+                            status="busy",
+                            message=reason
+                            or "Cannot delete documents while pipeline is busy",
+                            doc_id=", ".join(doc_ids),
+                        )
+                    slot_acquired = True
+
+                    async def _run_delete_with_workspace():
+                        bg_rag = await workspace_mgr.acquire(workspace)
+                        try:
+                            await background_delete_documents(
+                                bg_rag,
+                                ws_doc_manager,
+                                doc_ids,
+                                delete_request.delete_file,
+                                delete_request.delete_llm_cache,
+                            )
+                        finally:
+                            await workspace_mgr.release(workspace)
+
+                    background_tasks.add_task(_run_delete_with_workspace)
+                    # Ownership of the slot transferred to the bg task — it
+                    # will release in its finally.  The endpoint's finally
+                    # below must NOT release it again.
+                    slot_acquired = False
+
+                    return DeleteDocByIdResponse(
+                        status="deletion_started",
+                        message=f"Document deletion for {len(doc_ids)} documents has been initiated. Processing will continue in background.",
+                        doc_id=", ".join(doc_ids),
+                    )
+
+                except Exception as e:
+                    error_msg = f"Error initiating document deletion for {delete_request.doc_ids}: {str(e)}"
+                    logger.error(error_msg)
+                    logger.error(traceback.format_exc())
+                    raise HTTPException(status_code=500, detail=error_msg)
+                finally:
+                    # If we reserved but never scheduled the bg task (e.g. an
+                    # unexpected error between acquire and add_task), release
+                    # so the next reservation / scan / enqueue can proceed.
+                    if slot_acquired:
+                        await _release_destructive_busy(rag)
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
                 )
-            slot_acquired = True
-
-            background_tasks.add_task(
-                background_delete_documents,
-                rag,
-                doc_manager,
-                doc_ids,
-                delete_request.delete_file,
-                delete_request.delete_llm_cache,
-            )
-            # Ownership of the slot transferred to the bg task — it
-            # will release in its finally.  The endpoint's finally
-            # below must NOT release it again.
-            slot_acquired = False
-
-            return DeleteDocByIdResponse(
-                status="deletion_started",
-                message=f"Document deletion for {len(doc_ids)} documents has been initiated. Processing will continue in background.",
-                doc_id=", ".join(doc_ids),
-            )
-
-        except Exception as e:
-            error_msg = f"Error initiating document deletion for {delete_request.doc_ids}: {str(e)}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=error_msg)
         finally:
-            # If we reserved but never scheduled the bg task (e.g. an
-            # unexpected error between acquire and add_task), release
-            # so the next reservation / scan / enqueue can proceed.
-            if slot_acquired:
-                await _release_destructive_busy(rag)
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.post(
         "/clear_cache",
         response_model=ClearCacheResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def clear_cache(request: ClearCacheRequest):
+    async def clear_cache(http_request: Request, request: ClearCacheRequest):
         """
         Clear all cache data from the LLM response cache storage.
 
@@ -3608,25 +3806,36 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs during cache clearing (500).
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            # Call the aclear_cache method (no modes parameter)
-            await rag.aclear_cache()
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                # Call the aclear_cache method (no modes parameter)
+                await rag.aclear_cache()
 
-            # Prepare success message
-            message = "Successfully cleared all cache"
+                # Prepare success message
+                message = "Successfully cleared all cache"
 
-            return ClearCacheResponse(status="success", message=message)
-        except Exception as e:
-            logger.error(f"Error clearing cache: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                return ClearCacheResponse(status="success", message=message)
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.get(
         "/track_status/{track_id}",
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(track_id: str) -> TrackStatusResponse:
+    async def get_track_status(
+        http_request: Request, track_id: str
+    ) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -3645,55 +3854,65 @@ def create_document_routes(
         Raises:
             HTTPException: If track_id is invalid (400) or an error occurs (500).
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            # Validate track_id
-            if not track_id or not track_id.strip():
-                raise HTTPException(status_code=400, detail="Track ID cannot be empty")
-
-            track_id = track_id.strip()
-
-            # Get documents by track_id
-            docs_by_track_id = await rag.aget_docs_by_track_id(track_id)
-
-            # Convert to response format
-            documents = []
-            status_summary = {}
-
-            for doc_id, doc_status in docs_by_track_id.items():
-                documents.append(
-                    DocStatusResponse(
-                        id=doc_id,
-                        content_summary=doc_status.content_summary,
-                        content_length=doc_status.content_length,
-                        status=doc_status.status,
-                        created_at=format_datetime(doc_status.created_at),
-                        updated_at=format_datetime(doc_status.updated_at),
-                        track_id=doc_status.track_id,
-                        chunks_count=doc_status.chunks_count,
-                        error_msg=doc_status.error_msg,
-                        metadata=doc_status.metadata,
-                        file_path=normalize_file_path(doc_status.file_path),
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                # Validate track_id
+                if not track_id or not track_id.strip():
+                    raise HTTPException(
+                        status_code=400, detail="Track ID cannot be empty"
                     )
+
+                track_id = track_id.strip()
+
+                # Get documents by track_id
+                docs_by_track_id = await rag.aget_docs_by_track_id(track_id)
+
+                # Convert to response format
+                documents = []
+                status_summary = {}
+
+                for doc_id, doc_status in docs_by_track_id.items():
+                    documents.append(
+                        DocStatusResponse(
+                            id=doc_id,
+                            content_summary=doc_status.content_summary,
+                            content_length=doc_status.content_length,
+                            status=doc_status.status,
+                            created_at=format_datetime(doc_status.created_at),
+                            updated_at=format_datetime(doc_status.updated_at),
+                            track_id=doc_status.track_id,
+                            chunks_count=doc_status.chunks_count,
+                            error_msg=doc_status.error_msg,
+                            metadata=doc_status.metadata,
+                            file_path=normalize_file_path(doc_status.file_path),
+                        )
+                    )
+
+                    # Build status summary
+                    # Handle both DocStatus enum and string cases for robust deserialization
+                    status_key = str(doc_status.status)
+                    status_summary[status_key] = status_summary.get(status_key, 0) + 1
+
+                return TrackStatusResponse(
+                    track_id=track_id,
+                    documents=documents,
+                    total_count=len(documents),
+                    status_summary=status_summary,
                 )
-
-                # Build status summary
-                # Handle both DocStatus enum and string cases for robust deserialization
-                status_key = str(doc_status.status)
-                status_summary[status_key] = status_summary.get(status_key, 0) + 1
-
-            return TrackStatusResponse(
-                track_id=track_id,
-                documents=documents,
-                total_count=len(documents),
-                status_summary=status_summary,
-            )
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error getting track status for {track_id}: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+            except HTTPException:
+                raise
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.post(
         "/paginated",
@@ -3701,6 +3920,7 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def get_documents_paginated(
+        http_request: Request,
         request: DocumentsRequest,
     ) -> PaginatedDocsResponse:
         """
@@ -3722,166 +3942,174 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving documents (500).
         """
-        trace_id = uuid4().hex[:8]
-        request_start = time.perf_counter()
-        status_filter_value = (
-            request.status_filter.value if request.status_filter is not None else None
-        )
-        workspace = getattr(rag, "workspace", None)
-
-        performance_timing_log(
-            "[documents/paginated][%s] Request start workspace=%s status_filter=%s page=%s page_size=%s sort_field=%s sort_direction=%s",
-            trace_id,
-            workspace,
-            status_filter_value,
-            request.page,
-            request.page_size,
-            request.sort_field,
-            request.sort_direction,
-        )
-
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-
-            async def _timed_call(operation_name: str, operation):
-                operation_start = time.perf_counter()
-                performance_timing_log(
-                    "[documents/paginated][%s] %s started",
-                    trace_id,
-                    operation_name,
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                trace_id = uuid4().hex[:8]
+                request_start = time.perf_counter()
+                status_filter_value = (
+                    request.status_filter.value
+                    if request.status_filter is not None
+                    else None
                 )
-                try:
-                    result = await operation
-                except Exception:
+
+                performance_timing_log(
+                    "[documents/paginated][%s] Request start workspace=%s status_filter=%s page=%s page_size=%s sort_field=%s sort_direction=%s",
+                    trace_id,
+                    workspace,
+                    status_filter_value,
+                    request.page,
+                    request.page_size,
+                    request.sort_field,
+                    request.sort_direction,
+                )
+
+                async def _timed_call(operation_name: str, operation):
+                    operation_start = time.perf_counter()
+                    performance_timing_log(
+                        "[documents/paginated][%s] %s started",
+                        trace_id,
+                        operation_name,
+                    )
+                    try:
+                        result = await operation
+                    except Exception:
+                        elapsed = time.perf_counter() - operation_start
+                        performance_timing_log(
+                            "[documents/paginated][%s] %s failed after %.4fs",
+                            trace_id,
+                            operation_name,
+                            elapsed,
+                        )
+                        raise
+
                     elapsed = time.perf_counter() - operation_start
                     performance_timing_log(
-                        "[documents/paginated][%s] %s failed after %.4fs",
+                        "[documents/paginated][%s] %s completed in %.4fs",
                         trace_id,
                         operation_name,
                         elapsed,
                     )
-                    raise
+                    return result
 
-                elapsed = time.perf_counter() - operation_start
-                performance_timing_log(
-                    "[documents/paginated][%s] %s completed in %.4fs",
-                    trace_id,
-                    operation_name,
-                    elapsed,
-                )
-                return result
-
-            query_task_create_start = time.perf_counter()
-            docs_task = asyncio.create_task(
-                _timed_call(
-                    "get_docs_paginated",
-                    rag.doc_status.get_docs_paginated(
-                        status_filter=request.status_filter,
-                        status_filters=request.status_filters,
-                        page=request.page,
-                        page_size=request.page_size,
-                        sort_field=request.sort_field,
-                        sort_direction=request.sort_direction,
-                    ),
-                )
-            )
-            status_counts_task = asyncio.create_task(
-                _timed_call(
-                    "get_all_status_counts",
-                    rag.doc_status.get_all_status_counts(),
-                )
-            )
-            query_task_create_elapsed = time.perf_counter() - query_task_create_start
-            performance_timing_log(
-                "[documents/paginated][%s] Query tasks created in %.4fs",
-                trace_id,
-                query_task_create_elapsed,
-            )
-
-            query_await_start = time.perf_counter()
-            (documents_with_ids, total_count), status_counts = await asyncio.gather(
-                docs_task, status_counts_task
-            )
-            query_await_elapsed = time.perf_counter() - query_await_start
-            performance_timing_log(
-                "[documents/paginated][%s] Query tasks awaited in %.4fs",
-                trace_id,
-                query_await_elapsed,
-            )
-
-            # Convert documents to response format
-            response_assembly_start = time.perf_counter()
-            doc_responses = []
-            for doc_id, doc in documents_with_ids:
-                doc_responses.append(
-                    DocStatusResponse(
-                        id=doc_id,
-                        content_summary=doc.content_summary,
-                        content_length=doc.content_length,
-                        status=doc.status,
-                        created_at=format_datetime(doc.created_at),
-                        updated_at=format_datetime(doc.updated_at),
-                        track_id=doc.track_id,
-                        chunks_count=doc.chunks_count,
-                        error_msg=doc.error_msg,
-                        metadata=doc.metadata,
-                        file_path=normalize_file_path(doc.file_path),
+                query_task_create_start = time.perf_counter()
+                docs_task = asyncio.create_task(
+                    _timed_call(
+                        "get_docs_paginated",
+                        rag.doc_status.get_docs_paginated(
+                            status_filter=request.status_filter,
+                            status_filters=request.status_filters,
+                            page=request.page,
+                            page_size=request.page_size,
+                            sort_field=request.sort_field,
+                            sort_direction=request.sort_direction,
+                        ),
                     )
                 )
+                status_counts_task = asyncio.create_task(
+                    _timed_call(
+                        "get_all_status_counts",
+                        rag.doc_status.get_all_status_counts(),
+                    )
+                )
+                query_task_create_elapsed = (
+                    time.perf_counter() - query_task_create_start
+                )
+                performance_timing_log(
+                    "[documents/paginated][%s] Query tasks created in %.4fs",
+                    trace_id,
+                    query_task_create_elapsed,
+                )
 
-            # Calculate pagination info
-            total_pages = (total_count + request.page_size - 1) // request.page_size
-            has_next = request.page < total_pages
-            has_prev = request.page > 1
+                query_await_start = time.perf_counter()
+                (documents_with_ids, total_count), status_counts = await asyncio.gather(
+                    docs_task, status_counts_task
+                )
+                query_await_elapsed = time.perf_counter() - query_await_start
+                performance_timing_log(
+                    "[documents/paginated][%s] Query tasks awaited in %.4fs",
+                    trace_id,
+                    query_await_elapsed,
+                )
 
-            pagination = PaginationInfo(
-                page=request.page,
-                page_size=request.page_size,
-                total_count=total_count,
-                total_pages=total_pages,
-                has_next=has_next,
-                has_prev=has_prev,
-            )
-            response = PaginatedDocsResponse(
-                documents=doc_responses,
-                pagination=pagination,
-                status_counts=status_counts,
-            )
-            response_assembly_elapsed = time.perf_counter() - response_assembly_start
-            total_elapsed = time.perf_counter() - request_start
+                # Convert documents to response format
+                response_assembly_start = time.perf_counter()
+                doc_responses = []
+                for doc_id, doc in documents_with_ids:
+                    doc_responses.append(
+                        DocStatusResponse(
+                            id=doc_id,
+                            content_summary=doc.content_summary,
+                            content_length=doc.content_length,
+                            status=doc.status,
+                            created_at=format_datetime(doc.created_at),
+                            updated_at=format_datetime(doc.updated_at),
+                            track_id=doc.track_id,
+                            chunks_count=doc.chunks_count,
+                            error_msg=doc.error_msg,
+                            metadata=doc.metadata,
+                            file_path=normalize_file_path(doc.file_path),
+                        )
+                    )
 
-            performance_timing_log(
-                "[documents/paginated][%s] Response assembled in %.4fs",
-                trace_id,
-                response_assembly_elapsed,
-            )
-            performance_timing_log(
-                "[documents/paginated][%s] Request completed in %.4fs returned_rows=%s total_count=%s status_count_keys=%s",
-                trace_id,
-                total_elapsed,
-                len(doc_responses),
-                total_count,
-                sorted(status_counts.keys()),
-            )
+                # Calculate pagination info
+                total_pages = (total_count + request.page_size - 1) // request.page_size
+                has_next = request.page < total_pages
+                has_prev = request.page > 1
 
-            return response
+                pagination = PaginationInfo(
+                    page=request.page,
+                    page_size=request.page_size,
+                    total_count=total_count,
+                    total_pages=total_pages,
+                    has_next=has_next,
+                    has_prev=has_prev,
+                )
+                response = PaginatedDocsResponse(
+                    documents=doc_responses,
+                    pagination=pagination,
+                    status_counts=status_counts,
+                )
+                response_assembly_elapsed = (
+                    time.perf_counter() - response_assembly_start
+                )
+                total_elapsed = time.perf_counter() - request_start
 
-        except Exception as e:
-            total_elapsed = time.perf_counter() - request_start
-            performance_timing_log(
-                "[documents/paginated][%s] Request failed after %.4fs",
-                trace_id,
-                total_elapsed,
-            )
-            logger.error(f"Error getting paginated documents: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                performance_timing_log(
+                    "[documents/paginated][%s] Response assembled in %.4fs",
+                    trace_id,
+                    response_assembly_elapsed,
+                )
+                performance_timing_log(
+                    "[documents/paginated][%s] Request completed in %.4fs returned_rows=%s total_count=%s status_count_keys=%s",
+                    trace_id,
+                    total_elapsed,
+                    len(doc_responses),
+                    total_count,
+                    sorted(status_counts.keys()),
+                )
+
+                return response
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.get(
         "/status_counts",
         response_model=StatusCountsResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_document_status_counts() -> StatusCountsResponse:
+    async def get_document_status_counts(
+        http_request: Request,
+    ) -> StatusCountsResponse:
         """
         Get counts of documents by status.
 
@@ -3894,21 +4122,31 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving status counts (500).
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            status_counts = await rag.doc_status.get_all_status_counts()
-            return StatusCountsResponse(status_counts=status_counts)
-
-        except Exception as e:
-            logger.error(f"Error getting document status counts: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                status_counts = await rag.doc_status.get_all_status_counts()
+                return StatusCountsResponse(status_counts=status_counts)
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.post(
         "/reprocess_failed",
         response_model=ReprocessResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def reprocess_failed_documents(background_tasks: BackgroundTasks):
+    async def reprocess_failed_documents(
+        http_request: Request, background_tasks: BackgroundTasks
+    ):
         """
         Reprocess failed and pending documents.
 
@@ -3933,28 +4171,44 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while initiating reprocessing (500).
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            # Start the reprocessing in the background
-            # Note: Reprocessed documents retain their original track_id from initial upload
-            background_tasks.add_task(rag.apipeline_process_enqueue_documents)
-            logger.info("Reprocessing of failed documents initiated")
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                # Start the reprocessing in the background
+                # Note: Reprocessed documents retain their original track_id from initial upload
 
-            return ReprocessResponse(
-                status="reprocessing_started",
-                message="Reprocessing of failed documents has been initiated in background. Documents retain their original track_id.",
-            )
+                async def _run_enqueue_with_workspace():
+                    bg_rag = await workspace_mgr.acquire(workspace)
+                    try:
+                        await bg_rag.apipeline_process_enqueue_documents()
+                    finally:
+                        await workspace_mgr.release(workspace)
 
-        except Exception as e:
-            logger.error(f"Error initiating reprocessing of failed documents: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                background_tasks.add_task(_run_enqueue_with_workspace)
+                logger.info("Reprocessing of failed documents initiated")
+
+                return ReprocessResponse(
+                    status="reprocessing_started",
+                    message="Reprocessing of failed documents has been initiated in background. Documents retain their original track_id.",
+                )
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     @router.post(
         "/cancel_pipeline",
         response_model=CancelPipelineResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def cancel_pipeline():
+    async def cancel_pipeline(http_request: Request):
         """
         Request cancellation of the currently running pipeline.
 
@@ -3975,41 +4229,49 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while setting cancellation flag (500).
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
-            from lightrag.kg.shared_storage import (
-                get_namespace_data,
-                get_namespace_lock,
-            )
+            rag = await workspace_mgr.acquire(workspace)
+            try:
+                from lightrag.kg.shared_storage import (
+                    get_namespace_data,
+                    get_namespace_lock,
+                )
 
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
-            )
-            pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
-            )
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=rag.workspace
+                )
+                pipeline_status_lock = get_namespace_lock(
+                    "pipeline_status", workspace=rag.workspace
+                )
 
-            async with pipeline_status_lock:
-                if not pipeline_status.get("busy", False):
-                    return CancelPipelineResponse(
-                        status="not_busy",
-                        message="Pipeline is not currently running. No cancellation needed.",
-                    )
+                async with pipeline_status_lock:
+                    if not pipeline_status.get("busy", False):
+                        return CancelPipelineResponse(
+                            status="not_busy",
+                            message="Pipeline is not currently running. No cancellation needed.",
+                        )
 
-                # Set cancellation flag
-                pipeline_status["cancellation_requested"] = True
-                cancel_msg = "Pipeline cancellation requested by user"
-                logger.info(cancel_msg)
-                pipeline_status["latest_message"] = cancel_msg
-                pipeline_status["history_messages"].append(cancel_msg)
+                    # Set cancellation flag
+                    pipeline_status["cancellation_requested"] = True
+                    cancel_msg = "Pipeline cancellation requested by user"
+                    logger.info(cancel_msg)
+                    pipeline_status["latest_message"] = cancel_msg
+                    pipeline_status["history_messages"].append(cancel_msg)
 
-            return CancelPipelineResponse(
-                status="cancellation_requested",
-                message="Pipeline cancellation has been requested. Documents will be marked as FAILED.",
-            )
-
-        except Exception as e:
-            logger.error(f"Error requesting pipeline cancellation: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+                return CancelPipelineResponse(
+                    status="cancellation_requested",
+                    message="Pipeline cancellation has been requested. Documents will be marked as FAILED.",
+                )
+            except WorkspaceCacheFullError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace cache is full.",
+                    headers={"Retry-After": "5"},
+                )
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     return router

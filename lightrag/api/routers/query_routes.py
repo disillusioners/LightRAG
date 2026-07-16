@@ -4,9 +4,14 @@ This module contains all query-related routes for the LightRAG API.
 
 import json
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from lightrag.api.utils_api import (
+    get_combined_auth_dependency,
+    get_workspace_from_request,
+)
+from lightrag.api.workspace_manager import WorkspaceCacheFullError
 from lightrag.base import QueryParam
-from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
 
@@ -188,7 +193,7 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(workspace_mgr, api_key: Optional[str] = None, top_k: int = 60):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
@@ -326,7 +331,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, http_request: Request):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -402,7 +407,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 - 400: Invalid input parameters (e.g., query too short)
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
+            rag = await workspace_mgr.acquire(workspace)
             param = request.to_query_params(
                 False
             )  # Ensure stream=False for non-streaming endpoint
@@ -449,9 +457,18 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 return QueryResponse(response=response_content, references=references)
             else:
                 return QueryResponse(response=response_content, references=None)
+        except WorkspaceCacheFullError:
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace cache is full. All instances are in use. Retry shortly.",
+                headers={"Retry-After": "5"},
+            )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     def _build_stream_generator(
         *,
@@ -596,7 +613,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, http_request: Request):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -723,12 +740,21 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             This endpoint is ideal for applications requiring flexible response delivery.
             Use streaming mode for real-time interfaces and non-streaming for batch processing.
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
+        released = False
+
+        async def _release_once():
+            nonlocal released
+            if not released:
+                released = True
+                await workspace_mgr.release(workspace)
+
         try:
+            rag = await workspace_mgr.acquire(workspace)
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
-
-            from fastapi.responses import StreamingResponse
 
             # Unified approach: always use aquery_llm for all cases
             result = await rag.aquery_llm(request.query, param=param)
@@ -738,8 +764,16 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 include_chunk_content=request.include_chunk_content,
             )
 
+            async def _generate():
+                try:
+                    gen = stream_gen()
+                    async for chunk in gen:
+                        yield chunk
+                finally:
+                    await _release_once()
+
             return StreamingResponse(
-                stream_gen(),
+                _generate(),
                 media_type="application/x-ndjson",
                 headers={
                     "Cache-Control": "no-cache",
@@ -748,9 +782,30 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     "X-Accel-Buffering": "no",  # Ensure proper handling of streaming response when proxied by Nginx
                 },
             )
+        except WorkspaceCacheFullError:
+            # acquire() failed before rag was set; do NOT call _release_once()
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace cache is full. All instances are in use. Retry shortly.",
+                headers={"Retry-After": "5"},
+            )
         except Exception as e:
+            await _release_once()
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+        except BaseException:
+            # Catches asyncio.CancelledError (ASGI client disconnect) AND any other BaseException
+            await _release_once()
+            raise
+        # NOTE: no outer `finally` on the streaming path. ``return StreamingResponse(...)``
+        # would trigger an outer ``finally`` BEFORE Starlette iterates the body (Python
+        # ``try/finally`` semantics on ``return``), which would drop the workspace ref
+        # to 0 while the body is still in flight — letting a concurrent acquire-miss
+        # tombstone+finalize the rag out from under the body iterator. The inner
+        # ``_generate()``'s ``finally`` is the sole release point for the success path;
+        # the ``except Exception`` / ``except BaseException`` arms cover the error/cancel
+        # paths; ``except WorkspaceCacheFullError`` covers the acquire-failed case.
+        # See ``tests/workspace/test_streaming_release.py::test_streaming_workspace_held_until_body_completes``.
 
     @router.post(
         "/query/data",
@@ -1048,7 +1103,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(request: QueryRequest, http_request: Request):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 
@@ -1151,7 +1206,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             This endpoint always includes references regardless of the include_references parameter,
             as structured data analysis typically requires source attribution.
         """
+        workspace = get_workspace_from_request(http_request)
+        rag = None
         try:
+            rag = await workspace_mgr.acquire(workspace)
             param = request.to_query_params(False)  # No streaming for data endpoint
             response = await rag.aquery_data(request.query, param=param)
 
@@ -1166,8 +1224,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     data={},
                     metadata={},
                 )
+        except WorkspaceCacheFullError:
+            raise HTTPException(
+                status_code=503,
+                detail="Workspace cache is full. All instances are in use. Retry shortly.",
+                headers={"Retry-After": "5"},
+            )
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if rag is not None:
+                await workspace_mgr.release(workspace)
 
     return router

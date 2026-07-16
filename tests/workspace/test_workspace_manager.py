@@ -158,6 +158,35 @@ async def manager(mock_factory, manager_args):
     return mgr
 
 
+async def _wait_for_eviction_finalize(
+    manager, workspace: str, max_yields: int = 100
+) -> None:
+    """Yield to the event loop until ``workspace``'s tombstone is popped.
+
+    After :meth:`WorkspaceManager._evict_if_needed` selects a victim the
+    actual ``await rag.finalize_storages()`` runs in a background
+    :meth:`_safe_finalize` task that re-acquires ``_cache_lock`` to pop
+    the tombstone once the await resolves. The cache state observed by
+    callers is therefore briefly inconsistent with the new behavior —
+    the entry remains as a ``None`` tombstone for the duration of that
+    background await.
+
+    Test helper that polls the cache under the lock until the tombstone
+    is gone. With the AsyncMock-based test doubles the background
+    finalize completes in well under 10 yields, so the bound is
+    generous safety against scheduling jitter rather than a real timeout.
+    """
+    for _ in range(max_yields):
+        async with manager._cache_lock:
+            if workspace not in manager._cache:
+                return
+        await asyncio.sleep(0)
+    raise AssertionError(
+        f"Background _safe_finalize did not pop tombstone for {workspace!r} "
+        f"within {max_yields} yields; cache still has {workspace!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. Identity on cache hit
 # ---------------------------------------------------------------------------
@@ -192,6 +221,11 @@ class TestLruEviction:
         await manager.release("ws-b")
         await manager.acquire("ws-c")
         await manager.release("ws-c")
+        # Filling to capacity evicts the default-workspace entry
+        # (initialize() preloaded it as the LRU). Wait for its
+        # background _safe_finalize to pop the tombstone before
+        # asserting cache keys.
+        await _wait_for_eviction_finalize(manager, "")
 
         assert set(manager._cache.keys()) == {"ws-a", "ws-b", "ws-c"}
         # ws-a is the oldest (first in OrderedDict).
@@ -201,6 +235,11 @@ class TestLruEviction:
         # Acquire a new workspace — triggers eviction of the LRU candidate.
         await manager.acquire("ws-d")
         await manager.release("ws-d")
+        # Eviction now defers finalize_storages to a background task so
+        # the lock-held-during-await footprint is bounded (see
+        # WorkspaceManager._evict_if_needed). Yield to the event loop
+        # until the bg task pops the tombstone.
+        await _wait_for_eviction_finalize(manager, "ws-a")
 
         assert "ws-a" not in manager._cache, "Oldest entry must be evicted"
         assert "ws-d" in manager._cache
@@ -226,6 +265,11 @@ class TestRefcountProtectsFromEviction:
         await manager.release("ws-b")
         await manager.acquire("ws-c")
         await manager.release("ws-c")
+        # Filling to capacity evicts the default-workspace entry
+        # (initialize() preloaded it as the LRU). Wait for its
+        # background _safe_finalize to pop the tombstone before
+        # asserting the LRU candidate.
+        await _wait_for_eviction_finalize(manager, "")
 
         # Confirm the precondition: ws-a is the LRU candidate but still in use.
         assert next(iter(manager._cache)) == "ws-a"
@@ -235,6 +279,8 @@ class TestRefcountProtectsFromEviction:
         # the next refcount=0 candidate (ws-b, the oldest such).
         await manager.acquire("ws-d")
         await manager.release("ws-d")
+        # Eviction deferred finalize to a background task; let it pop.
+        await _wait_for_eviction_finalize(manager, "ws-b")
 
         assert "ws-a" in manager._cache, "ws-a must NOT be evicted while in use"
         assert "ws-b" not in manager._cache, "ws-b should be the one evicted"
@@ -414,6 +460,9 @@ class TestEvictionRaceWithActiveAcquire:
         #    NOT be evicted; the LRU refcount=0 candidate (ws-b) gets evicted.
         await manager.acquire("ws-d")
         await manager.release("ws-d")
+        # Eviction deferred finalize to a background task; let it pop
+        # before we assert against the post-eviction cache state.
+        await _wait_for_eviction_finalize(manager, "ws-b")
         assert "ws-a" in manager._cache, "ws-a is in use, must not be evicted"
         assert "ws-b" not in manager._cache, "ws-b should be the LRU victim"
         assert "ws-d" in manager._cache
@@ -439,6 +488,8 @@ class TestEvictionRaceWithActiveAcquire:
         #    holder task released.
         await manager.acquire("ws-e")
         await manager.release("ws-e")
+        # Eviction deferred finalize to a background task; let it pop.
+        await _wait_for_eviction_finalize(manager, "ws-c")
         assert "ws-c" not in manager._cache
         assert "ws-a" in manager._cache
         assert "ws-e" in manager._cache
@@ -463,6 +514,8 @@ class TestEvictedInstanceFinalized:
         await manager.release("ws-c")
         await manager.acquire("ws-d")  # evicts ws-a
         await manager.release("ws-d")
+        # Eviction deferred finalize to a background task; let it pop.
+        await _wait_for_eviction_finalize(manager, "ws-a")
 
         assert rag_a.finalize_storages.call_count == 1  # type: ignore[attr-defined]
         # Re-acquiring ws-a yields a NEW instance with different identity.
@@ -504,6 +557,8 @@ class TestCacheFull:
         await manager.release("")
         rag_new = await manager.acquire("ws-new")
         await manager.release("ws-new")
+        # Eviction deferred finalize to a background task; let it pop.
+        await _wait_for_eviction_finalize(manager, "")
         assert rag_new is not None
         assert "" not in manager._cache
         assert "ws-new" in manager._cache
