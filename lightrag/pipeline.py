@@ -23,6 +23,7 @@ import re
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,7 +41,15 @@ from lightrag.exceptions import (
     PipelineCancelledException,
     IndexFlushError,
 )
-from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
+from lightrag.kg.shared_storage import (
+    _reservation_owner_token,
+    get_namespace_data,
+    get_namespace_lock,
+    make_owner_record,
+    pipeline_recovery_blocked_message,
+    reconcile_dead_pipeline_reservations,
+    run_to_completion,
+)
 from lightrag.operate import merge_nodes_and_edges
 from lightrag.parser.base import ParseContext
 from lightrag.parser.llm_bridge import LLMBridgePipelineCancelled
@@ -84,6 +93,7 @@ from lightrag.utils_pipeline import (
     build_chunks_dict_from_chunking_result,
     chunk_fields_from_status_doc,
     compute_text_content_hash,
+    doc_status_custom_chunk_patch,
     doc_status_field,
     doc_status_parse_failure_fields,
     doc_status_transition_metadata,
@@ -337,6 +347,15 @@ class _PipelineMixin:
             "pipeline_status", workspace=self.workspace
         )
         async with pipeline_status_lock:
+            # Reclaim a dead owner, then fail-closed if the workspace is fenced.
+            # This is the core write path: the public ``ainsert`` and any direct
+            # caller bypass the REST ``_reserve_enqueue_slot`` guard, so a fenced
+            # workspace (a dead custom_chunks/delete/clear owner may have
+            # half-committed) must refuse HERE too, or it would write full_docs /
+            # doc_status onto a partially-committed store.
+            reconcile_dead_pipeline_reservations(pipeline_status)
+            if pipeline_status.get("recovery_required"):
+                raise RuntimeError(pipeline_recovery_blocked_message(pipeline_status))
             if not from_scan and pipeline_status.get("scanning_exclusive"):
                 raise RuntimeError(
                     "Cannot enqueue while scan is classifying files; "
@@ -650,6 +669,8 @@ class _PipelineMixin:
         enqueue_serialize_lock = get_namespace_lock(
             "enqueue_serialize", workspace=self.workspace
         )
+        status_upsert_error: Exception | None = None
+        process_after_status_error = False
 
         async with enqueue_serialize_lock:
             # 3. Filter out already processed documents
@@ -850,8 +871,55 @@ class _PipelineMixin:
             await self.full_docs.index_done_callback()
 
             # Store document status (without content)
-            await self.doc_status.upsert(new_docs)
-            logger.debug(f"Stored {len(new_docs)} new unique documents")
+            try:
+                await self.doc_status.upsert(new_docs)
+            except Exception as exc:
+                status_upsert_error = exc
+                # A doc-status write may partially commit before failing (e.g.
+                # OpenSearch bulk reports per-item failures after some PENDING
+                # rows already landed). Decide how to avoid stranding committed
+                # rows here, under the same lock the processing loop uses for
+                # its atomic busy/exit handoff; the actual wake runs after the
+                # lock is released (see below). The original storage error is
+                # always re-raised.
+                try:
+                    async with pipeline_status_lock:
+                        if pipeline_status.get("busy"):
+                            pipeline_status["request_pending"] = True
+                        else:
+                            process_after_status_error = True
+                except Exception as wake_error:
+                    logger.warning(
+                        "Failed to wake document processing after enqueue "
+                        f"status upsert error: {wake_error}"
+                    )
+            else:
+                logger.debug(f"Stored {len(new_docs)} new unique documents")
+
+        if status_upsert_error is not None:
+            if process_after_status_error:
+                # Best-effort recovery, NOT a confirmed partial-commit signal:
+                # this fires on ANY upsert error while the pipeline is idle,
+                # because neither doc_status.upsert nor this function can
+                # cheaply tell whether rows actually landed (only some backends
+                # like OpenSearch bulk commit partially before raising). Safe to
+                # over-call — apipeline_process_enqueue_documents is busy-gated
+                # and queries the real doc_status, so with nothing committed it
+                # is a cheap no-op ("No documents to process"). The caller will
+                # not trigger processing itself (it is about to get an
+                # exception), so we run one inline pass here before re-raising.
+                try:
+                    await self.apipeline_process_enqueue_documents()
+                except Exception as wake_error:
+                    logger.warning(
+                        "Failed to start document processing after enqueue "
+                        f"status upsert error: {wake_error}"
+                    )
+            # Bare re-raise preserves the exception's original __traceback__:
+            # only the local `exc` name was unbound at the end of the except
+            # block; the exception object and its traceback survive via
+            # status_upsert_error.
+            raise status_upsert_error
 
         # Notify any in-flight processing loop that new work has arrived.
         # The loop checks ``request_pending`` after each batch and will
@@ -940,7 +1008,9 @@ class _PipelineMixin:
                     f"File processing error: - ID: {doc_id} {error_doc['file_path']}"
                 )
 
-    async def apipeline_process_enqueue_documents(self) -> None:
+    async def apipeline_process_enqueue_documents(
+        self, _holding_busy: bool = False, token: str | None = None
+    ) -> None:
         """
         Process pending documents by splitting them into chunks, processing
         each chunk for entity and relation extraction, and updating the
@@ -951,6 +1021,16 @@ class _PipelineMixin:
         3. Split document content into chunks
         4. Process each chunk for entity and relation extraction
         5. Update the document status
+
+        ``_holding_busy`` (internal): when True the caller already owns the
+        ``busy`` slot and hands it to this run atomically — used by
+        ``ainsert_custom_chunks`` to drain a ``request_pending`` that arrived
+        while it held ``busy``, without ever dropping ``busy`` to False (which
+        would open a window for a clear/delete/scan reservation to start and
+        drop the accepted-but-unprocessed document). This run takes over the
+        existing slot instead of re-acquiring it, and always releases it — on
+        the no-work path, on a get-docs failure, and via the loop's finally —
+        so a handoff can never wedge the pipeline as permanently busy.
         """
         pipeline_status = await get_namespace_data(
             "pipeline_status", workspace=self.workspace
@@ -959,56 +1039,88 @@ class _PipelineMixin:
             "pipeline_status", workspace=self.workspace
         )
 
-        async with pipeline_status_lock:
-            # Ensure only one worker is processing documents
-            if not pipeline_status.get("busy", False):
-                to_process_docs: dict[
-                    str, DocProcessingStatus
-                ] = await self.doc_status.get_docs_by_statuses(
-                    list(_INFLIGHT_DOC_STATUSES)
-                )
+        # Owner token for this run's ``busy`` reservation. A handed-off run
+        # (``_holding_busy``) reuses the caller's token — it already owns the
+        # slot — so the caller's release and this run's release refer to the
+        # same owner; a normal run mints its own.
+        if _holding_busy:
+            if token is None:
+                raise ValueError("_holding_busy requires the owner token")
+        else:
+            token = uuid.uuid4().hex
 
-                if not to_process_docs:
-                    logger.info("No documents to process")
-                    return
+        # A handed-off slot is ours from entry; a normal run owns it only after
+        # it sets busy=True below. The finally releases ``busy`` iff we own it.
+        holds_busy = _holding_busy
 
-                pipeline_status.update(
-                    {
-                        "busy": True,
-                        "job_name": "Default Job",
-                        "job_start": datetime.now(timezone.utc).isoformat(),
-                        "docs": 0,
-                        "batchs": 0,  # Total number of files to be processed
-                        "cur_batch": 0,  # Number of files already processed
-                        "request_pending": False,  # Clear any previous request
-                        "cancellation_requested": False,  # Initialize cancellation flag
-                        "cancellation_reason": None,  # "internal_error" or None (user)
-                        "cancellation_detail": None,  # driver + root cause for internal
-                        "latest_message": "",
-                    }
-                )
-                # Cleaning history_messages without breaking it as a shared list object
-                del pipeline_status["history_messages"][:]
-            else:
-                # Another process is busy, just set request flag and return
-                pipeline_status["request_pending"] = True
-                logger.info(
-                    "Another process is already processing the document queue. Request queued."
-                )
-                return
-
-        # Tracks whether the loop has already released ``busy`` under
-        # the same critical section that observed request_pending=False.
-        # This makes the exit handoff atomic: a concurrent enqueue can
-        # either set request_pending BEFORE we release (in which case
-        # the loop continues with a fresh snapshot) or AFTER (in which
-        # case it sees busy=False and starts a new loop via its own
-        # process_enqueue call).  Without this, a small window between
-        # "loop reads request_pending=False" and "finally clears busy"
-        # could strand newly-enqueued PENDING docs.
+        # Tracks whether the loop already released ``busy`` under the same
+        # critical section that observed request_pending=False. This makes the
+        # exit handoff atomic: a concurrent enqueue either sets request_pending
+        # BEFORE we release (loop continues with a fresh snapshot) or AFTER (it
+        # sees busy=False and starts a new loop via its own process_enqueue).
         busy_released_in_loop = False
 
         try:
+            async with pipeline_status_lock:
+                # Reclaim any reservation whose owner process is confirmed dead
+                # BEFORE reading busy, so a SIGKILLed worker's slot does not
+                # wedge this acquire (Linux multi-worker only; no-op otherwise).
+                reconcile_dead_pipeline_reservations(pipeline_status)
+                # Fail-closed: if reconcile fenced the workspace (a dead
+                # custom_chunks/delete/clear owner may have half-committed) it
+                # ALSO cleared ``busy``, so without this check the loop would see
+                # busy=False and immediately process documents on a possibly
+                # inconsistent store. Refuse until an explicit recovery.
+                if pipeline_status.get("recovery_required"):
+                    logger.warning(pipeline_recovery_blocked_message(pipeline_status))
+                    return
+                # Ensure only one worker is processing documents. ``_holding_busy``
+                # means the slot was handed to us already owned, so take it over
+                # rather than treating busy=True as "someone else is running".
+                if _holding_busy or not pipeline_status.get("busy", False):
+                    to_process_docs: dict[
+                        str, DocProcessingStatus
+                    ] = await self.doc_status.get_docs_by_statuses(
+                        list(_INFLIGHT_DOC_STATUSES)
+                    )
+
+                    if not to_process_docs:
+                        # Nothing to do. A handed-off slot is released by the
+                        # finally (holds_busy, owner-checked); a normal run
+                        # never took the slot, so the finally is a no-op.
+                        logger.info("No documents to process")
+                        return
+
+                    pipeline_status.update(
+                        {
+                            "busy": True,
+                            "busy_owner": make_owner_record(token, "processing"),
+                            "job_name": "Default Job",
+                            "job_start": datetime.now(timezone.utc).isoformat(),
+                            "docs": 0,
+                            "batchs": 0,  # Total number of files to be processed
+                            "cur_batch": 0,  # Number of files already processed
+                            "request_pending": False,  # Clear any previous request
+                            "cancellation_requested": False,  # Initialize cancellation flag
+                            "cancellation_reason": None,  # "internal_error" or None (user)
+                            "cancellation_detail": None,  # driver + root cause for internal
+                            "latest_message": "",
+                        }
+                    )
+                    # Cleaning history_messages without breaking it as a shared list object
+                    del pipeline_status["history_messages"][:]
+                    holds_busy = True
+                else:
+                    # Another process is busy, just set request flag and return
+                    pipeline_status["request_pending"] = True
+                    logger.info(
+                        "Another process is already processing the document queue. Request queued."
+                    )
+                    return
+            # The acquire lock exits here (an await point). Because it is INSIDE
+            # this try, a cancellation delivered at the lock exit still runs the
+            # finally, which releases ``busy`` iff we own it (holds_busy + token).
+
             # Process documents until no more documents or requests
             while True:
                 # Check for cancellation request at the start of main loop
@@ -1020,8 +1132,6 @@ class _PipelineMixin:
                             == "internal_error"
                         )
                         label = self._cancellation_label(pipeline_status)
-                        pipeline_status["request_pending"] = False
-                        pipeline_status["cancellation_requested"] = False
 
                         if is_internal:
                             # Unrecoverable storage error: halting is intentional
@@ -1035,10 +1145,16 @@ class _PipelineMixin:
                         else:
                             log_message = f"Pipeline cancelled ({label})"
                             logger.info(log_message)
-                        pipeline_status["latest_message"] = log_message
+                        pipeline_status.update(
+                            {
+                                "request_pending": False,
+                                "cancellation_requested": False,
+                                "cancellation_reason": None,
+                                "cancellation_detail": None,
+                                "latest_message": log_message,
+                            }
+                        )
                         pipeline_status["history_messages"].append(log_message)
-                        pipeline_status["cancellation_reason"] = None
-                        pipeline_status["cancellation_detail"] = None
 
                         # Exit directly, skipping request_pending check
                         return
@@ -1082,10 +1198,14 @@ class _PipelineMixin:
 
                 log_message = f"Processing {len(to_process_docs)} document(s)"
                 logger.info(log_message)
-                pipeline_status["docs"] = len(to_process_docs)
-                pipeline_status["batchs"] = len(to_process_docs)
-                pipeline_status["cur_batch"] = 0
-                pipeline_status["latest_message"] = log_message
+                pipeline_status.update(
+                    {
+                        "docs": len(to_process_docs),
+                        "batchs": len(to_process_docs),
+                        "cur_batch": 0,
+                        "latest_message": log_message,
+                    }
+                )
                 pipeline_status["history_messages"].append(log_message)
 
                 await self._run_pipeline_batch(
@@ -1117,40 +1237,61 @@ class _PipelineMixin:
 
         finally:
             stopped_message = "Enqueued document processing pipeline stopped"
-            logger.info(stopped_message)
-            # If the loop already released ``busy`` under the atomic exit
-            # check, don't clobber it here — a concurrent enqueue may have
-            # observed busy=False and started a new processing pass that
-            # has set busy=True for itself.  Cancellation flag and log
-            # bookkeeping are always safe to update.
-            async with pipeline_status_lock:
-                if not busy_released_in_loop:
-                    pipeline_status["busy"] = False
-                # An internal-error abort normally exits via the batch's
-                # ``break`` (not the loop-top cancellation handler, which
-                # logs + clears the reason itself), so without this the only
-                # visible trace would be the generic "stopped" line. Surface
-                # the actionable halt reason here too, BEFORE clearing the
-                # reason/detail. Read it first so _cancellation_label still
-                # sees the cause.
-                internal_halt = None
-                if pipeline_status.get("cancellation_reason") == "internal_error":
-                    internal_halt = self._internal_halt_message(
-                        self._cancellation_label(pipeline_status)
-                    )
-                    logger.error(internal_halt)
-                pipeline_status["cancellation_requested"] = (
-                    False  # Always reset cancellation flag
+
+            async def _finalize():
+                # Cancellation-resistant, owner-checked release + bookkeeping.
+                # Only runs when THIS invocation actually held the slot: a queued
+                # request, a normal no-docs return, or a get-docs failure before
+                # acquiring never entered here (holds_busy stays False), so we
+                # never touch another run's state.
+                if not holds_busy:
+                    return
+                logger.info(stopped_message)
+                lock = get_namespace_lock("pipeline_status", workspace=self.workspace)
+                status = await get_namespace_data(
+                    "pipeline_status", workspace=self.workspace
                 )
-                pipeline_status["cancellation_reason"] = None
-                pipeline_status["cancellation_detail"] = None
-                pipeline_status["history_messages"].append(stopped_message)
-                if internal_halt is not None:
-                    pipeline_status["history_messages"].append(internal_halt)
-                    # Prefer the actionable halt reason as the latest message.
-                    pipeline_status["latest_message"] = internal_halt
-                else:
-                    pipeline_status["latest_message"] = stopped_message
+                async with lock:
+                    current_owner = _reservation_owner_token(status.get("busy_owner"))
+                    # Release ``busy`` only if the loop did not already release it
+                    # under the atomic exit check AND we still own the slot.
+                    if not busy_released_in_loop and current_owner == token:
+                        status.update({"busy": False, "busy_owner": None})
+                        current_owner = None  # slot is now free
+
+                    # Bookkeeping (cancellation reset, stopped/halt messages) must
+                    # NOT touch a slot a DIFFERENT owner has already taken: once the
+                    # loop released busy, a concurrent enqueue can acquire and set
+                    # its own cancellation state, which we must not clear. Only run
+                    # bookkeeping while the slot is still ours or free.
+                    if current_owner is not None and current_owner != token:
+                        return
+
+                    # An internal-error abort exits via the batch's break (not the
+                    # loop-top handler), so surface the actionable halt reason here
+                    # BEFORE clearing the reason/detail (read it first so
+                    # _cancellation_label sees the cause).
+                    internal_halt = None
+                    if status.get("cancellation_reason") == "internal_error":
+                        internal_halt = self._internal_halt_message(
+                            self._cancellation_label(status)
+                        )
+                        logger.error(internal_halt)
+                    status.update(
+                        {
+                            "cancellation_requested": False,
+                            "cancellation_reason": None,
+                            "cancellation_detail": None,
+                            "latest_message": internal_halt
+                            if internal_halt
+                            else stopped_message,
+                        }
+                    )
+                    status["history_messages"].append(stopped_message)
+                    if internal_halt is not None:
+                        status["history_messages"].append(internal_halt)
+
+            await run_to_completion(_finalize)
 
     # ============================================================
     # Pipeline orchestration
@@ -1359,6 +1500,30 @@ class _PipelineMixin:
         pipeline_status_lock: asyncio.Lock,
     ) -> dict[str, DocProcessingStatus]:
         """Validate and fix document data consistency by deleting inconsistent entries, but preserve failed documents"""
+        # Documents carrying a custom-chunk patch journal belong to an
+        # in-flight or failed ainsert_custom_chunks operation (issue #3400
+        # Phase 3). Ordinary pipeline processing must not touch them: a reset
+        # would strip the journal and rebuild the whole document, discarding
+        # the operation's recovery anchor. They are resumed by the SDK caller
+        # (same call) or rolled back by /documents/scan.
+        journaled_patch_docs = [
+            doc_id
+            for doc_id, status_doc in to_process_docs.items()
+            if doc_status_custom_chunk_patch(status_doc) is not None
+        ]
+        if journaled_patch_docs:
+            for doc_id in journaled_patch_docs:
+                to_process_docs.pop(doc_id, None)
+            async with pipeline_status_lock:
+                skip_message = (
+                    f"Skipping {len(journaled_patch_docs)} document(s) with an "
+                    "unfinished custom-chunk operation (retry the operation or "
+                    "run a scan to roll it back)"
+                )
+                logger.info(skip_message)
+                pipeline_status["latest_message"] = skip_message
+                pipeline_status["history_messages"].append(skip_message)
+
         inconsistent_docs = []
         failed_docs_to_preserve = []
         successful_deletions = 0
@@ -1560,7 +1725,10 @@ class _PipelineMixin:
             if pipeline_status.get("request_pending", False):
                 pipeline_status["request_pending"] = False
                 return False
-            pipeline_status["busy"] = False
+            # Release the slot together with its owner token so a later
+            # owner-checked release (the finally, or a fresh acquirer) sees the
+            # slot as free and unowned.
+            pipeline_status.update({"busy": False, "busy_owner": None})
             return True
 
     @staticmethod
@@ -2105,10 +2273,14 @@ class _PipelineMixin:
                 logger.error(f"Unhandled error in process worker; aborting batch: {e}")
                 logger.error(traceback.format_exc())
                 async with ctx.pipeline_status_lock:
-                    ctx.pipeline_status["cancellation_requested"] = True
-                    ctx.pipeline_status["cancellation_reason"] = "internal_error"
-                    ctx.pipeline_status["cancellation_detail"] = (
-                        f"process worker unhandled error: {e}"
+                    ctx.pipeline_status.update(
+                        {
+                            "cancellation_requested": True,
+                            "cancellation_reason": "internal_error",
+                            "cancellation_detail": (
+                                f"process worker unhandled error: {e}"
+                            ),
+                        }
                     )
             finally:
                 ctx.q_process.task_done()
@@ -2175,18 +2347,22 @@ class _PipelineMixin:
                 async with ctx.pipeline_status_lock:
                     ctx.processed_count += 1
                     current_file_number = ctx.processed_count
-                    ctx.pipeline_status["cur_batch"] = ctx.processed_count
 
-                    log_message = (
+                    extraction_message = (
                         f"Extracting stage {current_file_number}/"
                         f"{ctx.total_files}: {file_path}"
                     )
-                    logger.info(log_message)
-                    ctx.pipeline_status["history_messages"].append(log_message)
-                    log_message = f"Processing d-id: {doc_id}"
-                    logger.info(log_message)
-                    ctx.pipeline_status["latest_message"] = log_message
-                    ctx.pipeline_status["history_messages"].append(log_message)
+                    logger.info(extraction_message)
+                    processing_message = f"Processing d-id: {doc_id}"
+                    logger.info(processing_message)
+                    ctx.pipeline_status.update(
+                        {
+                            "cur_batch": ctx.processed_count,
+                            "latest_message": processing_message,
+                        }
+                    )
+                    ctx.pipeline_status["history_messages"].append(extraction_message)
+                    ctx.pipeline_status["history_messages"].append(processing_message)
 
                     # Prevent memory growth: keep only latest 5000 messages
                     # when exceeding 10000.  Trim in place so Manager.list-
@@ -2681,6 +2857,22 @@ class _PipelineMixin:
                         ctx.pipeline_status, ctx.pipeline_status_lock
                     )
 
+                    # Flush ALL derived stores BEFORE the durable PROCESSED
+                    # write. doc_status backends persist immediately on
+                    # upsert, so writing PROCESSED first opens a crash window
+                    # where the status is durable but the graph/vector/chunk
+                    # data is not — a false PROCESSED that recovery can never
+                    # detect (issue #3400: status is the commit record).
+                    await self._insert_done()
+
+                    # A sibling document's flush error may have aborted the
+                    # batch while our flush ran; do not mark PROCESSED during
+                    # teardown — bail out so this document is FAILED and
+                    # retried on the next run.
+                    await self._raise_if_cancelled(
+                        ctx.pipeline_status, ctx.pipeline_status_lock
+                    )
+
                     process_end_time = int(time.time())
                     await self._upsert_doc_status_transition(
                         doc_id=doc_id,
@@ -2697,8 +2889,6 @@ class _PipelineMixin:
                             **extraction_meta,
                         },
                     )
-
-                    await self._insert_done()
 
                     async with ctx.pipeline_status_lock:
                         log_message = (
@@ -2721,12 +2911,15 @@ class _PipelineMixin:
                     # and root cause so it is distinguishable from a user cancel.
                     if isinstance(e, IndexFlushError):
                         async with ctx.pipeline_status_lock:
-                            ctx.pipeline_status["cancellation_requested"] = True
-                            ctx.pipeline_status["cancellation_reason"] = (
-                                "internal_error"
-                            )
-                            ctx.pipeline_status["cancellation_detail"] = (
-                                f"{e.storage_name}[{e.namespace}]: {e.__cause__}"
+                            ctx.pipeline_status.update(
+                                {
+                                    "cancellation_requested": True,
+                                    "cancellation_reason": "internal_error",
+                                    "cancellation_detail": (
+                                        f"{e.storage_name}[{e.namespace}]: "
+                                        f"{e.__cause__}"
+                                    ),
+                                }
                             )
                         logger.error(
                             f"Aborting pipeline batch due to storage flush error: {e}"
