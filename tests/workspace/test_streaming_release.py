@@ -302,6 +302,7 @@ def _make_fake_query_request() -> Any:
             self.mode = "mix"
             self.include_references = True
             self.include_chunk_content = False
+            self.include_progress = False
             self.stream = True
             self.conversation_history = None
             self.user_prompt = None

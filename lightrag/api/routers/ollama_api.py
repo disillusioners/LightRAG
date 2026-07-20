@@ -14,6 +14,7 @@ from lightrag.utils import TiktokenTokenizer
 from lightrag.api.utils_api import (
     get_combined_auth_dependency,
     get_workspace_from_request,
+    internal_server_error,
 )
 from lightrag.api.workspace_manager import WorkspaceCacheFullError
 from fastapi import Depends
@@ -528,7 +529,7 @@ class OllamaAPI:
             except Exception as e:
                 logger.error(f"Ollama generate error: {str(e)}", exc_info=True)
                 await _release_once()
-                raise HTTPException(status_code=500, detail=str(e))
+                raise internal_server_error(e)
             except BaseException:
                 # Catches asyncio.CancelledError (ASGI client disconnect) AND any other BaseException
                 await _release_once()
@@ -841,7 +842,7 @@ class OllamaAPI:
             except Exception as e:
                 logger.error(f"Ollama chat error: {str(e)}", exc_info=True)
                 await _release_once()
-                raise HTTPException(status_code=500, detail=str(e))
+                raise internal_server_error(e)
             except BaseException:
                 # Catches asyncio.CancelledError (ASGI client disconnect) AND any other BaseException
                 await _release_once()
