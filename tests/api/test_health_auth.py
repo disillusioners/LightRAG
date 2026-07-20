@@ -86,13 +86,25 @@ class _FakeLightRAG:
     async def get_rerank_queue_status(self):
         return {}
 
+    # Workspace isolation v2: WorkspaceManager._create_rag_instance awaits
+    # these on every fresh instance (default-workspace eager init at lifespan
+    # startup, plus per-request acquire on authenticated /health probes).
+    async def initialize_storages(self):
+        return None
+
+    async def check_and_migrate_data(self):
+        return None
+
+    async def finalize_storages(self):
+        return None
+
 
 class _FakeOllamaAPI:
     def __init__(self, *_args, **_kwargs):
         self.router = APIRouter()
 
 
-def _build_client(monkeypatch, *, api_key=None):
+def _build_client(monkeypatch, *, api_key=None, pipeline_status=None):
     """Build a /health-capable TestClient with all backend I/O mocked out."""
     from lightrag.api.config import parse_args, initialize_config
 
@@ -107,8 +119,13 @@ def _build_client(monkeypatch, *, api_key=None):
     initialize_config(args, force=True)
 
     import lightrag.api.lightrag_server as lightrag_server
+    import lightrag.api.workspace_manager as workspace_manager
 
-    monkeypatch.setattr(lightrag_server, "LightRAG", _FakeLightRAG)
+    # Workspace isolation v2: LightRAG is no longer a module-level attribute on
+    # lightrag_server. WorkspaceManager imports it directly and is what actually
+    # instantiates LightRAG instances, so the monkeypatch must target that
+    # binding (same fix as commit 5a565de3 for test_login_route.py).
+    monkeypatch.setattr(workspace_manager, "LightRAG", _FakeLightRAG)
     monkeypatch.setattr(lightrag_server, "check_frontend_build", lambda: (True, False))
     monkeypatch.setattr(
         lightrag_server, "create_document_routes", lambda *_a, **_k: APIRouter()
@@ -121,7 +138,13 @@ def _build_client(monkeypatch, *, api_key=None):
     )
     monkeypatch.setattr(lightrag_server, "OllamaAPI", _FakeOllamaAPI)
     monkeypatch.setattr(
-        lightrag_server, "get_namespace_data", AsyncMock(return_value={"busy": False})
+        lightrag_server,
+        "get_namespace_data",
+        AsyncMock(
+            return_value=(
+                {"busy": False} if pipeline_status is None else pipeline_status
+            )
+        ),
     )
     monkeypatch.setattr(lightrag_server, "get_default_workspace", lambda: "default")
     monkeypatch.setattr(
@@ -172,6 +195,34 @@ def test_open_mode_returns_full_config_to_anonymous(monkeypatch):
 
     assert resp.status_code == 200
     _assert_full_config(resp.json())
+
+
+def test_health_reads_pipeline_status_with_one_snapshot(monkeypatch):
+    class SnapshotOnlyStatus(dict):
+        copy_calls = 0
+
+        def copy(self):
+            self.copy_calls += 1
+            return dict.copy(self)
+
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("/health must not issue per-field proxy gets")
+
+    status = SnapshotOnlyStatus(
+        {
+            "busy": False,
+            "scanning": False,
+            "destructive_busy": False,
+            "pending_enqueues": 0,
+        }
+    )
+    client = _build_client(monkeypatch, pipeline_status=status)
+    _set_auth_mode(monkeypatch, auth_configured=False)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert status.copy_calls == 1
 
 
 # --------------------------------------------------------------------------- #
